@@ -21,6 +21,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const skipDuplicatesCheckbox = document.getElementById('skipDuplicatesCheckbox');
   const autoStopCheckbox     = document.getElementById('autoStopCheckbox');
   const maxCapturesInput     = document.getElementById('maxCapturesInput');
+  const maxStripTilesInput   = document.getElementById('maxStripTilesInput');
   const captureModeGroup     = document.getElementById('captureModeGroup');
   const modeStatus           = document.getElementById('modeStatus');
   const zoomMultiplierGroup  = document.getElementById('zoomMultiplierGroup');
@@ -292,6 +293,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.activeElement !== maxCapturesInput) {
       maxCapturesInput.value = state.maxCaptures || 0;
     }
+    if (document.activeElement !== maxStripTilesInput) {
+      maxStripTilesInput.value = state.maxStripTiles ?? 2000;
+    }
 
     // Capture mode, e.g. "Screen", "Long", "Hi-Res 4x", "Long + Hi-Res 4x"
     const zoomMultiplier = state.zoomMultiplier || 4;
@@ -453,6 +457,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const value = Math.max(0, parseInt(maxCapturesInput.value, 10) || 0);
     maxCapturesInput.value = value;
     chrome.runtime.sendMessage({ command: 'updateOption', key: 'maxCaptures', value });
+  });
+
+  maxStripTilesInput.addEventListener('change', () => {
+    const value = Math.max(0, parseInt(maxStripTilesInput.value, 10) || 0);
+    maxStripTilesInput.value = value;
+    chrome.runtime.sendMessage({ command: 'updateOption', key: 'maxStripTiles', value });
   });
 
   createPdfCheckbox.addEventListener('change', () => {

@@ -20,7 +20,8 @@ let state = {
   runSkipped: 0,          // duplicate captures skipped in the current run
   longCapture: false,     // Long: scroll and stitch the whole page into one strip
   hiRes: false,           // Hi-Res: render at zoomMultiplier× (also applies to Long)
-  zoomMultiplier: 4       // 2 | 3 | 4 -- Hi-Res resolution multiplier (Settings)
+  zoomMultiplier: 4,      // 2 | 3 | 4 -- Hi-Res resolution multiplier (Settings)
+  maxStripTiles: 2000     // Long: max scroll steps per capture, 0 = no limit (Settings)
 };
 
 const ZOOM_ATTACH_SETTLE_DELAY = 300; // ms for the page to repaint after the debugger bar appears
@@ -31,7 +32,6 @@ const MAX_ZOOM_AREA = 64000000; // max zoom output px, keeps canvas memory ~256M
 const SCROLL_SETTLE_DELAY = 250; // ms to let lazy content/repaints settle after each scroll step
 const MAX_STRIP_HEIGHT = 32000; // px per stitched strip file (canvas dimension limit is 32767)
 const MAX_STRIP_AREA = 64000000; // px per stitched strip file, keeps canvas memory ~256MB
-const MAX_STRIP_TILES = 2000; // safety stop for infinite feeds that keep growing
 const CAPTURE_MIN_INTERVAL = 550; // captureVisibleTab is capped at 2 calls/sec
 const PDF_MAX_PAGE_DIM = 14400; // PDF spec limit for a page side, in points
 const PDF_BAND_PIXELS = 4000000; // px converted at a time when writing a PDF page
@@ -40,7 +40,7 @@ const PDF_BAND_PIXELS = 4000000; // px converted at a time when writing a PDF pa
 // idle (which resets everything in memory). Messages wait for this to load.
 const PERSISTED_KEYS = [
   'longCapture', 'hiRes', 'zoomMultiplier', 'createPdf', 'captureFirst', 'skipDuplicates',
-  'autoStopUnchanged', 'maxCaptures', 'macroEnabled', 'prefix', 'activeRecordingName'
+  'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'macroEnabled', 'prefix', 'activeRecordingName'
 ];
 
 const stateReady = chrome.storage.local.get(['savedRecordings', 'options']).then(({ savedRecordings, options }) => {
@@ -324,7 +324,7 @@ function handleMessage(message, sender, sendResponse) {
     state.createPdf = message.createPdf;
     sendResponse(state);
   } else if (message.command === 'updateOption') {
-    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
+    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
       state[message.key] = message.value;
     }
     sendResponse(state);
@@ -759,7 +759,9 @@ async function captureScrollStrip(tabs, tabId, hiRes, streamed) {
   try {
     let target = 0;
     let writtenPx = 0; // strip rows saved so far; strip row 0 = scroll position 0
-    for (let i = 0; i < MAX_STRIP_TILES && state.isPlaying; i++) {
+    // Step limit per capture: a safety stop for infinite feeds that keep growing
+    const maxSteps = state.maxStripTiles > 0 ? state.maxStripTiles : Infinity;
+    for (let i = 0; i < maxSteps && state.isPlaying; i++) {
       let actual, maxScroll;
       do {
         // Redone after a pause, in case the page was scrolled meanwhile
