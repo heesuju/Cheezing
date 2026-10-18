@@ -372,18 +372,29 @@ async function performCapture(tabs, tabId, prefix) {
   await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
   await chrome.tabs.sendMessage(tabId, { command: 'setLeaveGuard', enable: true }).catch(() => {});
   let images;
+  let streamed = null;
   try {
     if (state.longCapture) {
-      images = await captureScrollStrip(tabs, tabId, state.hiRes);
+      // A Long capture saves its parts as they're finished, unless it may
+      // still turn out to be a duplicate of the previous capture
+      if (!(state.skipDuplicates && lastSignature !== null)) streamed = new StreamedCapture(prefix);
+      images = await captureScrollStrip(tabs, tabId, state.hiRes, streamed);
     } else if (state.hiRes) {
       images = await captureHiRes(tabs, tabId);
     } else {
       images = await captureScreenshot(tabs, tabId);
     }
+  } catch (err) {
+    if (streamed) streamed.fail();
+    throw err;
   } finally {
     await chrome.tabs.sendMessage(tabId, { command: 'setLeaveGuard', enable: false }).catch(() => {});
   }
-  if (images && images.length > 0) await recordCapture(images, prefix);
+  if (streamed) {
+    streamed.finish();
+  } else if (images && images.length > 0) {
+    await recordCapture(images, prefix);
+  }
 }
 
 // ── Saving, duplicates & counters ─────────────────────────────────────
@@ -409,11 +420,8 @@ function resetRunCounters() {
 }
 
 async function recordCapture(images, prefix) {
-  if (state.skipDuplicates || state.autoStopUnchanged) {
-    const signature = await captureSignature(images);
-    const unchanged = lastSignature !== null && signaturesMatch(signature, lastSignature);
-    lastSignature = signature;
-    unchangedStreak = unchanged ? unchangedStreak + 1 : 0;
+  if (comparesCaptures()) {
+    const unchanged = compareWithPrevious(await captureSignature(images));
     if (unchanged && state.skipDuplicates) {
       state.runSkipped++;
       broadcastState();
@@ -429,20 +437,64 @@ async function recordCapture(images, prefix) {
   broadcastState();
 }
 
+// A Long capture saved part by part as the strip is built, so finished parts
+// don't wait in memory. It can't be skipped as a duplicate (its first parts
+// are saved before the rest exists), but is still compared for auto-stop.
+class StreamedCapture {
+  constructor(prefix) {
+    this.prefix = prefix;
+    this.number = 0;  // reserved when the first part is saved
+    this.signature = [];
+  }
+
+  async add(image) {
+    if (!this.number) this.number = ++captureCount;
+    if (comparesCaptures()) this.signature.push(await imageSignature(image.dataUrl));
+    await saveCapture(image.dataUrl, this.prefix, { number: this.number, suffix: image.suffix });
+    state.runSaved = captureCount;
+    broadcastState();
+  }
+
+  finish() {
+    if (this.number && comparesCaptures()) compareWithPrevious(this.signature);
+  }
+
+  // Parts already saved stay; the next capture has nothing whole to compare with
+  fail() {
+    lastSignature = null;
+    unchangedStreak = 0;
+  }
+}
+
+function comparesCaptures() {
+  return state.skipDuplicates || state.autoStopUnchanged;
+}
+
+// Records the capture's signature and returns whether it matches the previous one
+function compareWithPrevious(signature) {
+  const unchanged = lastSignature !== null && signaturesMatch(signature, lastSignature);
+  lastSignature = signature;
+  unchangedStreak = unchanged ? unchangedStreak + 1 : 0;
+  return unchanged;
+}
+
 async function captureSignature(images) {
   const signature = [];
-  for (const { dataUrl } of images) {
-    const bitmap = await dataUrlToBitmap(dataUrl);
-    const scale = Math.min(1, SIGNATURE_WIDTH / bitmap.width,
-      Math.sqrt(SIGNATURE_MAX_PIXELS / (bitmap.width * bitmap.height)));
-    const w = Math.max(1, Math.round(bitmap.width * scale));
-    const h = Math.max(1, Math.round(bitmap.height * scale));
-    const ctx = new OffscreenCanvas(w, h).getContext('2d');
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(bitmap, 0, 0, w, h);
-    signature.push({ w, h, data: ctx.getImageData(0, 0, w, h).data });
-  }
+  for (const { dataUrl } of images) signature.push(await imageSignature(dataUrl));
   return signature;
+}
+
+async function imageSignature(dataUrl) {
+  const bitmap = await dataUrlToBitmap(dataUrl);
+  const scale = Math.min(1, SIGNATURE_WIDTH / bitmap.width,
+    Math.sqrt(SIGNATURE_MAX_PIXELS / (bitmap.width * bitmap.height)));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const ctx = new OffscreenCanvas(w, h).getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  bitmap.close();
+  return { w, h, data: ctx.getImageData(0, 0, w, h).data };
 }
 
 function signaturesMatch(a, b) {
@@ -678,7 +730,9 @@ async function captureTab(windowId) {
 // region-height at a time and stitches every step into one continuous image.
 // Each step crops from the position the scroller actually reached, so the
 // last step (which can't scroll a full height) contributes only new rows.
-async function captureScrollStrip(tabs, tabId, hiRes) {
+// With `streamed`, each finished part is handed to it as soon as it's done
+// and the returned list is empty.
+async function captureScrollStrip(tabs, tabId, hiRes, streamed) {
   const windowId = tabs[0].windowId;
 
   await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
@@ -753,7 +807,7 @@ async function captureScrollStrip(tabs, tabId, hiRes) {
       const sh = Math.min(tileTop + regionH - from, source.height - sy);
       const isLast = actual >= maxScroll - 0.5;
       if (sh > 0) {
-        if (!writer) writer = new StripWriter(sw);
+        if (!writer) writer = new StripWriter(sw, streamed ? (image) => streamed.add(image) : null);
         const remaining = Math.round(maxScroll * scale) + regionH - from;
         await writer.add(source, sx, sy, sh, remaining);
         writtenPx = from + sh;
@@ -781,8 +835,9 @@ async function captureScrollStrip(tabs, tabId, hiRes) {
 // outgrows canvas limits it is split into consecutive _partN images that line
 // up edge to edge with no overlap.
 class StripWriter {
-  constructor(width) {
+  constructor(width, onPart) {
     this.width = width;
+    this.onPart = onPart; // receives each part when set, instead of keeping it in `images`
     this.images = [];
     this.parts = 0;
     this.canvas = null;
@@ -817,10 +872,14 @@ class StripWriter {
     }
     const dataUrl = await blobToDataUrl(await out.convertToBlob({ type: 'image/png' }));
     const suffix = isFinal && this.parts === 0 ? '' : `_part${++this.parts}`;
-    this.images.push({ dataUrl, suffix });
     this.canvas = null;
     this.ctx = null;
     this.y = 0;
+    if (this.onPart) {
+      await this.onPart({ dataUrl, suffix });
+    } else {
+      this.images.push({ dataUrl, suffix });
+    }
   }
 
   async finish() {
