@@ -1,4 +1,4 @@
-importScripts('pdf-lib.min.js', 'i18n.js');
+importScripts('pdf-store.js', 'i18n.js');
 
 let state = {
   isRecording: false,
@@ -34,6 +34,7 @@ const MAX_STRIP_AREA = 64000000; // px per stitched strip file, keeps canvas mem
 const MAX_STRIP_TILES = 500; // safety stop for infinite feeds that keep growing
 const CAPTURE_MIN_INTERVAL = 550; // captureVisibleTab is capped at 2 calls/sec
 const PDF_MAX_PAGE_DIM = 14400; // PDF spec limit for a page side, in points
+const PDF_BAND_PIXELS = 4000000; // px converted at a time when writing a PDF page
 
 // Settings that must survive Chrome shutting the service worker down when
 // idle (which resets everything in memory). Messages wait for this to load.
@@ -74,7 +75,6 @@ let pendingCaptureRatio = 'free';
 let captureCount = 0;
 let sessionPrefix = '';
 let currentSubfolder = '';
-let sessionCaptures = []; // { dataUrl, width, height } for PDF generation
 
 function getTodayDateKey() {
   const now = new Date();
@@ -1031,8 +1031,9 @@ async function saveCapture(dataUrl, prefix, { number, suffix = '' }) {
   });
 
   if (state.createPdf) {
-    const dims = await getImageDimensions(dataUrl);
-    sessionCaptures.push({ dataUrl, width: dims.width, height: dims.height });
+    const { width, height } = await getImageDimensions(dataUrl);
+    const blob = await (await fetch(dataUrl)).blob();
+    await pdfStore.addPage({ blob, width, height });
   }
 }
 
@@ -1080,7 +1081,7 @@ async function takeSingleCapture(prefix) {
   broadcastState();
 
   currentSubfolder = await getNextRunSubfolder();
-  sessionCaptures = [];
+  await pdfStore.clearPages().catch(() => {});
 
   // No prefix: files are just numbered, the dated run subfolder already says when
   sessionPrefix = prefix || '';
@@ -1104,7 +1105,7 @@ async function startPlayback(prefix) {
   state.isRecording = false; // Ensure recording is off
   
   currentSubfolder = await getNextRunSubfolder();
-  sessionCaptures = [];
+  await pdfStore.clearPages().catch(() => {});
 
   // No prefix: files are just numbered, the dated run subfolder already says when
   sessionPrefix = prefix || '';
@@ -1287,10 +1288,16 @@ async function endPlayback() {
   state.isPlaying = false;
   broadcastState();
 
-  if (state.createPdf && sessionCaptures.length > 0) {
-    await generateAndDownloadPdf(sessionCaptures, sessionPrefix, currentSubfolder);
+  try {
+    if (state.createPdf) {
+      const keys = await pdfStore.pageKeys();
+      if (keys.length > 0) await generateAndDownloadPdf(keys, sessionPrefix, currentSubfolder);
+    }
+  } catch (err) {
+    console.error('PDF generation failed:', err);
+  } finally {
+    await pdfStore.clearPages().catch(() => {});
   }
-  sessionCaptures = [];
 }
 
 async function getImageDimensions(dataUrl) {
@@ -1306,42 +1313,153 @@ async function getImageDimensions(dataUrl) {
   return { width: width >>> 0, height: height >>> 0 };
 }
 
-async function generateAndDownloadPdf(captures, prefix, subfolder) {
-  try {
-    const { PDFDocument } = PDFLib;
-    const pdfDoc = await PDFDocument.create();
+// ── PDF ────────────────────────────────────────────────────────────────
+// The run's images are kept in IndexedDB as they're saved (see pdf-store.js)
+// and written into the PDF one page at a time, so neither the images nor the
+// PDF ever sit in memory as a whole. Each page holds its image losslessly:
+// the exact pixels, deflate-compressed like the PNG itself.
+async function generateAndDownloadPdf(pageKeys, prefix, subfolder) {
+  const parts = [];   // Blob parts: text, and each image's compressed data
+  const offsets = []; // byte offset of each object, by object number
+  let offset = 0;
+  const encoder = new TextEncoder();
+  const write = (part) => {
+    if (typeof part === 'string') part = encoder.encode(part);
+    parts.push(part);
+    offset += part instanceof Blob ? part.size : part.byteLength;
+  };
+  const beginObject = (n) => {
+    offsets[n] = offset;
+    write(`${n} 0 obj\n`);
+  };
 
-    for (const capture of captures) {
-      const base64Data = capture.dataUrl.split(',')[1];
-      const pngBytes = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
-      const pngImage = await pdfDoc.embedPng(pngBytes);
+  // Objects 1 and 2 are the catalog and page tree (written last, once every
+  // page is known); each page then takes three: image, drawing, page.
+  write(new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x34, 0x0a, 0x25, 0xe2, 0xe3, 0xcf, 0xd3, 0x0a])); // %PDF-1.4, binary marker
+  const pageRefs = [];
+  for (const [i, key] of pageKeys.entries()) {
+    const page = await pdfStore.getPage(key);
+    if (!page) continue;
+    const image = await deflateImagePixels(page.blob);
+    const imageObj = 3 + i * 3;
+    const contentObj = imageObj + 1;
+    const pageObj = imageObj + 2;
 
-      // Create a page exactly the same size as the image (1pt = 1px), scaled
-      // down only when a long strip exceeds the PDF page size limit (14400pt)
-      const fit = Math.min(1, PDF_MAX_PAGE_DIM / Math.max(capture.width, capture.height));
-      const width = capture.width * fit;
-      const height = capture.height * fit;
-      const page = pdfDoc.addPage([width, height]);
-      page.drawImage(pngImage, { x: 0, y: 0, width, height });
-    }
+    beginObject(imageObj);
+    write(`<< /Type /XObject /Subtype /Image /Width ${image.width} /Height ${image.height} ` +
+      `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length ${image.data.size} >>\nstream\n`);
+    write(image.data);
+    write('\nendstream\nendobj\n');
 
-    const pdfBytes = await pdfDoc.save();
-    const pdfBlob = new Blob([pdfBytes], { type: 'application/pdf' });
-    const pdfDataUrl = await new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onloadend = () => resolve(reader.result);
-      reader.readAsDataURL(pdfBlob);
-    });
+    // A page exactly the size of the image (1pt = 1px), scaled down only when
+    // a long strip exceeds the PDF page size limit -- the pixels stay as they are
+    const fit = Math.min(1, PDF_MAX_PAGE_DIM / Math.max(image.width, image.height));
+    const width = pdfNumber(image.width * fit);
+    const height = pdfNumber(image.height * fit);
+    const content = `q ${width} 0 0 ${height} 0 0 cm /Im0 Do Q`;
+    beginObject(contentObj);
+    write(`<< /Length ${content.length} >>\nstream\n${content}\nendstream\nendobj\n`);
 
-    const filename = `${prefix || subfolder || 'capture'}.pdf`;
-    const filePath = subfolder ? `${subfolder}/${filename}` : filename;
-
-    await chrome.downloads.download({
-      url: pdfDataUrl,
-      filename: filePath,
-      saveAs: false
-    });
-  } catch (err) {
-    console.error('PDF generation failed:', err);
+    beginObject(pageObj);
+    write(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] ` +
+      `/Resources << /XObject << /Im0 ${imageObj} 0 R >> >> /Contents ${contentObj} 0 R >>\nendobj\n`);
+    pageRefs.push(`${pageObj} 0 R`);
   }
+  if (pageRefs.length === 0) return;
+
+  beginObject(1);
+  write('<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+  beginObject(2);
+  write(`<< /Type /Pages /Kids [${pageRefs.join(' ')}] /Count ${pageRefs.length} >>\nendobj\n`);
+
+  const xrefOffset = offset;
+  let xref = `xref\n0 ${offsets.length}\n0000000000 65535 f \n`;
+  for (let n = 1; n < offsets.length; n++) {
+    // Skipped (missing) pages leave unused numbers, listed as free
+    xref += offsets[n] === undefined
+      ? '0000000000 65535 f \n'
+      : `${String(offsets[n]).padStart(10, '0')} 00000 n \n`;
+  }
+  write(xref);
+  write(`trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+
+  const filename = `${prefix || subfolder || 'capture'}.pdf`;
+  await downloadPdf(new Blob(parts, { type: 'application/pdf' }), subfolder ? `${subfolder}/${filename}` : filename);
+}
+
+function pdfNumber(n) {
+  return String(Math.round(n * 1000) / 1000);
+}
+
+// The image's exact RGB pixels, deflate-compressed, converted a band of rows
+// at a time so only the decoded image and one band are in memory.
+// Screenshots are opaque; any transparency would show on white, as in a viewer.
+async function deflateImagePixels(blob) {
+  const bitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+  const { width, height } = bitmap;
+  const bandHeight = Math.max(1, Math.min(height, Math.floor(PDF_BAND_PIXELS / width)));
+  const ctx = new OffscreenCanvas(width, bandHeight).getContext('2d', { willReadFrequently: true });
+  const compressor = new CompressionStream('deflate'); // zlib format, which PDF's FlateDecode expects
+  const data = new Response(compressor.readable).blob();
+  const writer = compressor.writable.getWriter();
+  try {
+    for (let y = 0; y < height; y += bandHeight) {
+      const rows = Math.min(bandHeight, height - y);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, width, rows);
+      ctx.drawImage(bitmap, 0, y, width, rows, 0, 0, width, rows);
+      const rgba = ctx.getImageData(0, 0, width, rows).data;
+      const rgb = new Uint8Array(width * rows * 3);
+      for (let s = 0, d = 0; s < rgba.length; s += 4, d += 3) {
+        rgb[d] = rgba[s];
+        rgb[d + 1] = rgba[s + 1];
+        rgb[d + 2] = rgba[s + 2];
+      }
+      await writer.write(rgb);
+    }
+    await writer.close();
+  } finally {
+    bitmap.close();
+  }
+  return { width, height, data: await data };
+}
+
+// The service worker can't make a blob: URL, so the offscreen page does,
+// reading the PDF from IndexedDB. It stays open until the file is saved.
+async function downloadPdf(blob, filePath) {
+  await pdfStore.setOutput(blob);
+  try {
+    if (!(await chrome.offscreen.hasDocument())) {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['BLOBS'],
+        justification: 'Download the PDF built from the captures'
+      });
+    }
+    const { url } = await chrome.runtime.sendMessage({ command: 'getPdfUrl' });
+    if (!url) throw new Error('the offscreen page could not read the PDF');
+    const downloadId = await chrome.downloads.download({ url, filename: filePath, saveAs: false });
+    await waitForDownload(downloadId);
+  } finally {
+    await chrome.offscreen.closeDocument().catch(() => {});
+    await pdfStore.clearOutput().catch(() => {});
+  }
+}
+
+function waitForDownload(downloadId) {
+  return new Promise((resolve) => {
+    const done = (s) => s === 'complete' || s === 'interrupted';
+    const onChanged = (delta) => {
+      if (delta.id === downloadId && delta.state && done(delta.state.current)) finish();
+    };
+    const finish = () => {
+      chrome.downloads.onChanged.removeListener(onChanged);
+      resolve();
+    };
+    chrome.downloads.onChanged.addListener(onChanged);
+    // It may have finished before the listener was added
+    chrome.downloads.search({ id: downloadId }).then(([item]) => {
+      if (!item || done(item.state)) finish();
+    }, finish);
+  });
 }
