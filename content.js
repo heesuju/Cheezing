@@ -751,10 +751,20 @@
       if (url.startsWith('blob:')) {
         fetchUrl = await fetch(url).then((r) => r.blob()).then(blobToDataUrl).catch(() => null);
       }
-      // `ref` lets the background screenshot the image instead if its URL fails
-      images.push({ url: fetchUrl, ref: buildImageRef(node) });
+      // `ref` lets the background screenshot the image instead if its URL
+      // fails; `link` is a full-size file the image links to, if any
+      images.push({ url: fetchUrl, link: linkedImageUrl(node), ref: buildImageRef(node) });
     }
     return { images };
+  }
+
+  // A link around the image straight to an image file (what a lightbox opens)
+  function linkedImageUrl(node) {
+    const a = node.closest('a[href]');
+    if (!a) return null;
+    const url = usableUrl(a.getAttribute('href'), a);
+    if (!url || url.startsWith('data:') || url.startsWith('blob:')) return null;
+    return /\.(jpe?g|png|webp|gif|avif|bmp)$/i.test(new URL(url).pathname) ? url : null;
   }
 
   function buildImageRef(node) {

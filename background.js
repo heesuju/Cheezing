@@ -1,4 +1,4 @@
-importScripts('pdf-store.js', 'i18n.js');
+importScripts('pdf-store.js', 'i18n.js', 'originals.js');
 
 let state = {
   isRecording: false,
@@ -24,7 +24,8 @@ let state = {
   hiRes: false,           // Hi-Res: render at zoomMultiplier× (also applies to Long)
   zoomMultiplier: 4,      // 2 | 3 | 4 -- Hi-Res resolution multiplier (Settings)
   maxStripTiles: 2000,    // Long: max scroll steps per capture, 0 = no limit (Settings)
-  elementWait: 1          // Element: seconds to wait for the element to finish loading (Settings)
+  elementWait: 1,         // Element: seconds to wait for the element to finish loading (Settings)
+  findOriginals: true     // Element images: try URLs for the full-size original (Settings)
 };
 
 const ZOOM_ATTACH_SETTLE_DELAY = 300; // ms for the page to repaint after the debugger bar appears
@@ -47,7 +48,7 @@ const STEP_IMAGE_WAIT = 2000;       // max ms per Element capture step for image
 // idle (which resets everything in memory). Messages wait for this to load.
 const PERSISTED_KEYS = [
   'longCapture', 'hiRes', 'zoomMultiplier', 'createPdf', 'captureFirst', 'skipDuplicates',
-  'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'macroEnabled', 'prefix', 'activeRecordingName'
+  'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'findOriginals', 'macroEnabled', 'prefix', 'activeRecordingName'
 ];
 
 const stateReady = chrome.storage.local.get(['savedRecordings', 'options']).then(({ savedRecordings, options }) => {
@@ -360,7 +361,7 @@ function handleMessage(message, sender, sendResponse) {
     state.createPdf = message.createPdf;
     sendResponse(state);
   } else if (message.command === 'updateOption') {
-    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'elementSaveMode', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
+    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'elementSaveMode', 'findOriginals', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
       state[message.key] = message.value;
     }
     sendResponse(state);
@@ -549,7 +550,7 @@ async function saveElementImages(tabs, tabId, prefix) {
   for (const [i, image] of list.entries()) {
     if (!state.isPlaying) break;
     const suffix = '_' + String(i + 1).padStart(2, '0');
-    const file = image.url ? await fetchImageFile(image.url) : null;
+    const file = await fetchBestImage(image);
     if (file) {
       await saveImageFile(file, prefix, number, suffix);
     } else {
@@ -568,6 +569,34 @@ async function saveElementImages(tabs, tabId, prefix) {
   return true;
 }
 
+// The page's image, or a larger original found by editing its URL (see
+// originals.js). Candidates are fetched together; one wins only if it is an
+// image with more pixels than the page's, and -- for a generic guess -- the
+// same shape, so a wrong guess can never make the result worse.
+const ORIGINAL_ASPECT_TOLERANCE = 0.03; // generic guesses must keep the aspect ratio within 3%
+
+async function fetchBestImage(image) {
+  if (!image.url) return null;
+  const isDataUrl = image.url.startsWith('data:');
+  const candidates = state.findOriginals && !isDataUrl ? originalCandidates(image.url, image.link) : [];
+  const [page, ...found] = await Promise.all([
+    fetchImageFile(image.url),
+    ...candidates.map((c) => fetchImageFile(c.url))
+  ]);
+  let best = page;
+  candidates.forEach((candidate, i) => {
+    const file = found[i];
+    if (!file || !file.width) return;
+    if (best && file.width * file.height <= best.width * best.height) return;
+    if (candidate.strict && page && page.width) {
+      const pageAspect = page.width / page.height;
+      if (Math.abs(file.width / file.height - pageAspect) / pageAspect > ORIGINAL_ASPECT_TOLERANCE) return;
+    }
+    best = file;
+  });
+  return best;
+}
+
 const IMAGE_EXTENSIONS = {
   'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
   'image/avif': 'avif', 'image/svg+xml': 'svg', 'image/bmp': 'bmp', 'image/x-icon': 'ico'
@@ -581,15 +610,18 @@ async function fetchImageFile(url) {
     if (!response.ok) return null;
     const blob = await response.blob();
     let type = (blob.type || '').split(';')[0].toLowerCase();
+    // Decoded for its size (to compare with originals); SVGs can't be, and keep 0
+    const bitmap = await createImageBitmap(blob).catch(() => null);
+    const width = bitmap ? bitmap.width : 0;
+    const height = bitmap ? bitmap.height : 0;
+    if (bitmap) bitmap.close();
     if (!IMAGE_EXTENSIONS[type]) {
       // Some servers label images as binary data: accept it if it decodes
-      const bitmap = await createImageBitmap(blob).catch(() => null);
       if (!bitmap) return null;
-      bitmap.close();
       const fromUrl = (url.match(/\.(jpe?g|png|webp|gif|avif|bmp)(?:[?#]|$)/i) || [])[1];
       type = fromUrl ? `image/${fromUrl.toLowerCase().replace('jpg', 'jpeg')}` : 'image/png';
     }
-    return { blob, ext: IMAGE_EXTENSIONS[type] || 'png' };
+    return { blob, ext: IMAGE_EXTENSIONS[type] || 'png', width, height, url };
   } catch (err) {
     return null;
   }

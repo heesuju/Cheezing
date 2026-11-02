@@ -23,6 +23,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const maxCapturesInput     = document.getElementById('maxCapturesInput');
   const maxStripTilesInput   = document.getElementById('maxStripTilesInput');
   const elementWaitInput     = document.getElementById('elementWaitInput');
+  const findOriginalsCheckbox = document.getElementById('findOriginalsCheckbox');
   const captureModeGroup     = document.getElementById('captureModeGroup');
   const modeStatus           = document.getElementById('modeStatus');
   const zoomMultiplierGroup  = document.getElementById('zoomMultiplierGroup');
@@ -310,6 +311,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.activeElement !== maxStripTilesInput) {
       maxStripTilesInput.value = state.maxStripTiles ?? 2000;
     }
+    if (document.activeElement !== findOriginalsCheckbox) {
+      findOriginalsCheckbox.checked = state.findOriginals !== false;
+    }
     if (document.activeElement !== elementWaitInput) {
       elementWaitInput.value = state.elementWait ?? 1;
     }
@@ -495,6 +499,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const value = Math.max(0, parseInt(maxStripTilesInput.value, 10) || 0);
     maxStripTilesInput.value = value;
     chrome.runtime.sendMessage({ command: 'updateOption', key: 'maxStripTiles', value });
+  });
+
+  findOriginalsCheckbox.addEventListener('change', () => {
+    chrome.runtime.sendMessage({ command: 'updateOption', key: 'findOriginals', value: findOriginalsCheckbox.checked });
   });
 
   elementWaitInput.addEventListener('change', () => {

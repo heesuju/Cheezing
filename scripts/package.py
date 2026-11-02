@@ -17,6 +17,7 @@ FILES = [
     'popup.js',
     'i18n.js',
     'pdf-store.js',
+    'originals.js',
     'offscreen.html',
     'offscreen.js',
     'icons/icon_16.png',
