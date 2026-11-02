@@ -59,6 +59,9 @@
       sendResponse({ success: true });
     } else if (message.command === 'findPickedElement') {
       sendResponse(describePickedElement(message.element));
+    } else if (message.command === 'collectElementImages') {
+      collectElementImages(message.element).then(sendResponse, () => sendResponse({ images: [] }));
+      return true; // answered asynchronously
     } else if (message.command === 'suppressStickyElements') {
       suppressStickyElements(message.enable);
       sendResponse({ success: true });
@@ -546,7 +549,7 @@
     }
   }
 
-  function buildElementRef(el) {
+  function buildElementRef(el, countImages = true) {
     const frames = [];
     let win = viewOf(el);
     while (win.document !== document && win.frameElement) {
@@ -559,7 +562,8 @@
       frames,
       label: describeElement(el),
       width: Math.round(r.width),
-      height: Math.round(r.height)
+      height: Math.round(r.height),
+      imageCount: countImages ? findElementImages(el).length : 0
     };
   }
 
@@ -620,6 +624,177 @@
       pendingImages,
       msSinceMutation: getPageActivity().msSinceMutation
     };
+  }
+
+  // ── Images in a picked element ──────────────────────────────────────
+  // An element with images in it is saved as the image files themselves,
+  // from their URLs, at the best resolution the page offers. Counted are
+  // <img>s and CSS background images at least MIN_IMAGE_PX on each side, so
+  // icons, avatars and tracking pixels are left out.
+  const MIN_IMAGE_PX = 48;
+  const LAZY_SRC_ATTRS = ['data-lazy-src', 'data-original', 'data-src', 'data-lazy', 'data-url', 'data-full', 'data-large'];
+  const LAZY_SRCSET_ATTRS = ['data-srcset', 'data-lazy-srcset'];
+  const MIN_INLINE_IMAGE_CHARS = 2000; // shorter data: URLs are lazy-load placeholders
+  const PRIME_STEP_DELAY = 200;        // ms per step when scrolling lazy images in
+  const PRIME_MAX_STEPS = 100;
+
+  // [{ node, url }] in page order, each URL once
+  function findElementImages(root) {
+    const found = [];
+    const seen = new Set();
+    const add = (node, url) => {
+      if (!url || seen.has(url)) return;
+      seen.add(url);
+      found.push({ node, url });
+    };
+    for (const node of [root, ...root.querySelectorAll('*')]) {
+      const r = node.getBoundingClientRect();
+      const bigEnough = r.width >= MIN_IMAGE_PX && r.height >= MIN_IMAGE_PX;
+      if (node.tagName === 'IMG') {
+        // A lazy image not loaded yet may have no size, but its URL is known
+        const notLoadedYet = r.width === 0 || r.height === 0;
+        if (bigEnough || (notLoadedYet && hasLazySource(node))) add(node, bestImageUrl(node));
+      } else if (bigEnough) {
+        const bg = viewOf(node).getComputedStyle(node).backgroundImage;
+        if (bg && bg !== 'none') {
+          for (const m of bg.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/g)) add(node, usableUrl(m[2], node));
+        }
+      }
+    }
+    return found;
+  }
+
+  function hasLazySource(img) {
+    return [...LAZY_SRC_ATTRS, ...LAZY_SRCSET_ATTRS].some((a) => img.hasAttribute(a));
+  }
+
+  // The largest srcset candidate (of the img or its <picture>), else a lazy
+  // loader's real URL, else what's showing
+  function bestImageUrl(img) {
+    const sets = [img.getAttribute('srcset'), ...LAZY_SRCSET_ATTRS.map((a) => img.getAttribute(a))];
+    const picture = img.parentElement && img.parentElement.tagName === 'PICTURE' ? img.parentElement : null;
+    if (picture) {
+      for (const source of picture.querySelectorAll('source')) {
+        sets.push(source.getAttribute('srcset'), ...LAZY_SRCSET_ATTRS.map((a) => source.getAttribute(a)));
+      }
+    }
+    let best = null;
+    let bestScore = 0;
+    const baseWidth = img.naturalWidth || img.getBoundingClientRect().width || 1;
+    for (const set of sets) {
+      for (const { url, w, x } of parseSrcset(set)) {
+        const score = w || (x || 1) * baseWidth;
+        const usable = usableUrl(url, img);
+        if (usable && score > bestScore) {
+          best = usable;
+          bestScore = score;
+        }
+      }
+    }
+    if (best) return best;
+    for (const attr of LAZY_SRC_ATTRS) {
+      const url = usableUrl(img.getAttribute(attr), img);
+      if (url) return url;
+    }
+    return usableUrl(img.currentSrc, img) || usableUrl(img.getAttribute('src'), img);
+  }
+
+  // "a.jpg 800w, b.jpg 1600w" or "a.jpg, b.jpg 2x". Parsed as the HTML spec
+  // does: a URL runs to the next whitespace (so it may contain commas), and
+  // trailing commas on it end the candidate.
+  function parseSrcset(set) {
+    const out = [];
+    if (!set) return out;
+    let i = 0;
+    while (i < set.length) {
+      while (i < set.length && /[\s,]/.test(set[i])) i++;
+      let start = i;
+      while (i < set.length && !/\s/.test(set[i])) i++;
+      let url = set.slice(start, i);
+      if (!url) break;
+      let descriptor = '';
+      if (url.endsWith(',')) {
+        url = url.replace(/,+$/, '');
+      } else {
+        start = i;
+        while (i < set.length && set[i] !== ',') i++;
+        descriptor = set.slice(start, i).trim();
+        i++;
+      }
+      const m = descriptor.match(/^(\d+(?:\.\d+)?)([wx])/);
+      out.push({ url, w: m && m[2] === 'w' ? parseFloat(m[1]) : 0, x: m && m[2] === 'x' ? parseFloat(m[1]) : 0 });
+    }
+    return out;
+  }
+
+  function usableUrl(raw, node) {
+    if (!raw) return null;
+    raw = raw.trim();
+    if (raw.startsWith('data:')) return raw.length >= MIN_INLINE_IMAGE_CHARS ? raw : null;
+    try {
+      const url = new URL(raw, node.baseURI);
+      return /^(https?|blob):$/.test(url.protocol) ? url.href : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  // Scrolls lazy images in, then lists the element's images. Page-only
+  // blob: URLs are read here, since the extension can't open them.
+  async function collectElementImages(ref) {
+    const el = resolveElementRef(ref);
+    if (!el) return { images: [] };
+    await primeLazyImages(el);
+    const images = [];
+    for (const { node, url } of findElementImages(el)) {
+      let fetchUrl = url;
+      if (url.startsWith('blob:')) {
+        fetchUrl = await fetch(url).then((r) => r.blob()).then(blobToDataUrl).catch(() => null);
+      }
+      // `ref` lets the background screenshot the image instead if its URL fails
+      images.push({ url: fetchUrl, ref: buildImageRef(node) });
+    }
+    return { images };
+  }
+
+  function buildImageRef(node) {
+    return buildElementRef(node, false);
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  // Many sites only set an image's real URL once it scrolls into view, so
+  // an element taller than its scroller is scrolled through once first
+  async function primeLazyImages(el) {
+    const scroller = scrollerFor(el);
+    const view = scrollerRegion(scroller);
+    if (elementBox(el).height <= view.height) return;
+    const saved = scrollPositionsAround(el);
+    try {
+      el.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
+      for (let i = 0; i < PRIME_MAX_STEPS; i++) {
+        await sleep(PRIME_STEP_DELAY);
+        const box = elementBox(el);
+        if (box.y + box.height <= view.y + view.height) break; // bottom is in view
+        const before = scrollTop(scroller);
+        scrollerTo(scroller, before + view.height);
+        if (scrollTop(scroller) <= before + 0.5) break; // can't scroll further
+      }
+      await sleep(PRIME_STEP_DELAY);
+    } finally {
+      for (const { scroller: s, top, left } of saved) scrollerTo(s, top, left);
+    }
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   // ── Element picker ──────────────────────────────────────────────────
@@ -717,17 +892,35 @@
     picker.listeners = listeners;
 
     // Follows the highlighted element as the page scrolls or changes
+    let countedFor = null;
+    let imageNote = '';
     const tick = () => {
       if (!picker) return;
       const el = picker.current;
       if (el && el.isConnected) {
-        placeOverlayBox(box, elementBox(el), `${describeElement(el)}  ${Math.round(el.getBoundingClientRect().width)}×${Math.round(el.getBoundingClientRect().height)}`);
+        if (countedFor !== el) {
+          countedFor = el;
+          imageNote = imageCountNote(findElementImages(el).length);
+        }
+        const r = el.getBoundingClientRect();
+        placeOverlayBox(box, elementBox(el), `${describeElement(el)}  ${Math.round(r.width)}×${Math.round(r.height)}${imageNote}`);
       } else {
         box.root.style.display = 'none';
       }
       picker.raf = requestAnimationFrame(tick);
     };
     tick();
+  }
+
+  let isKorean = false;
+  chrome.storage.local.get('settings', ({ settings }) => {
+    isKorean = !!settings && settings.language === 'ko';
+  });
+
+  function imageCountNote(n) {
+    if (!n) return '';
+    if (isKorean) return `  · 이미지 ${n}개`;
+    return `  · ${n} image${n === 1 ? '' : 's'}`;
   }
 
   // The element one level out, crossing from a frame's body to the frame
@@ -787,7 +980,7 @@
         o.lookedUpAt = Date.now();
       }
       if (!o.hidden && o.el && o.el.isConnected) {
-        placeOverlayBox(o.box, elementBox(o.el), o.ref.label);
+        placeOverlayBox(o.box, elementBox(o.el), o.ref.label + imageCountNote(o.ref.imageCount));
       } else {
         o.box.root.style.display = 'none';
       }

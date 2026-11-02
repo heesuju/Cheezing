@@ -585,6 +585,15 @@ select {
 }
 
 /* Segmented Control */
+.element-save-group {
+  margin-top: 8px;
+}
+
+.element-save-group .segment-btn {
+  padding: 6px 8px;
+  font-size: 0.75rem;
+}
+
 .segmented-control {
   display: flex;
   background: var(--input-bg);

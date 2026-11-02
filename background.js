@@ -6,7 +6,8 @@ let state = {
   isPaused: false, // a capture is waiting for its tab to be visible again
   isSelectingArea: false,
   captureRect: null,
-  captureElement: null,   // picked element { selector, frames, label, width, height }, instead of an area
+  captureElement: null,   // picked element { selector, frames, label, width, height, imageCount }, instead of an area
+  elementSaveMode: 'images', // 'images': save the element's image files by URL | 'screenshot'
   prefix: '',
   actions: [],
   captureFirst: true,
@@ -286,6 +287,8 @@ function handleMessage(message, sender, sendResponse) {
     state.captureElement = message.element;
     state.captureRect = null;
     state.captureRatio = 'element';
+    // Images come first: an element with images in it saves the files
+    state.elementSaveMode = message.element.imageCount > 0 ? 'images' : 'screenshot';
     broadcastState();
     sendResponse(state);
   } else if (message.command === 'areaSelected') {
@@ -357,7 +360,7 @@ function handleMessage(message, sender, sendResponse) {
     state.createPdf = message.createPdf;
     sendResponse(state);
   } else if (message.command === 'updateOption') {
-    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
+    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'elementSaveMode', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
       state[message.key] = message.value;
     }
     sendResponse(state);
@@ -417,6 +420,10 @@ async function performCapture(tabs, tabId, prefix) {
   let images;
   let streamed = null;
   try {
+    if (state.captureElement && state.elementSaveMode === 'images' &&
+        await saveElementImages(tabs, tabId, prefix)) {
+      return; // saved as files; with no images found, it's screenshotted below
+    }
     if (state.longCapture || state.captureElement) {
       // A Long capture saves its parts as they're finished, unless it may
       // still turn out to be a duplicate of the previous capture. An Element
@@ -513,6 +520,100 @@ class StreamedCapture {
   }
 }
 
+// ── Element images ─────────────────────────────────────────────────────
+// Saves the picked element's images as the files themselves, fetched from
+// their URLs, numbered within the capture: prefix_001_01.jpg, _02.png...
+// An image whose URL can't be fetched (blocked, expired, not an image) is
+// screenshotted instead, at Hi-Res if that's on. Returns false if the
+// element has no images, so it's screenshotted as a whole.
+async function saveElementImages(tabs, tabId, prefix) {
+  const result = await chrome.tabs.sendMessage(tabId, {
+    command: 'collectElementImages',
+    element: state.captureElement
+  }).catch(() => null);
+  const list = (result && result.images) || [];
+  if (list.length === 0) return false;
+
+  // The same set of image URLs as last time is a duplicate (e.g. a macro
+  // page turn that didn't load anything new), skipped before downloading
+  if (comparesCaptures()) {
+    const unchanged = compareWithPrevious([{ urls: list.map((image) => image.url).join('\n') }]);
+    if (unchanged && state.skipDuplicates) {
+      state.runSkipped++;
+      broadcastState();
+      return true;
+    }
+  }
+
+  const number = ++captureCount;
+  for (const [i, image] of list.entries()) {
+    if (!state.isPlaying) break;
+    const suffix = '_' + String(i + 1).padStart(2, '0');
+    const file = image.url ? await fetchImageFile(image.url) : null;
+    if (file) {
+      await saveImageFile(file, prefix, number, suffix);
+    } else {
+      try {
+        const shots = await captureScrollStrip(tabs, tabId, state.hiRes, null, image.ref, false);
+        for (const shot of shots) {
+          await saveCapture(shot.dataUrl, prefix, { number, suffix: suffix + (shot.suffix || '') });
+        }
+      } catch (err) {
+        console.warn('Cheezing: could not save image', image.url, err);
+      }
+    }
+    state.runSaved = captureCount;
+    broadcastState();
+  }
+  return true;
+}
+
+const IMAGE_EXTENSIONS = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
+  'image/avif': 'avif', 'image/svg+xml': 'svg', 'image/bmp': 'bmp', 'image/x-icon': 'ico'
+};
+
+// The image's original bytes, or null if the URL doesn't give an image.
+// Sent with the browser's cookies, so images behind a login still load.
+async function fetchImageFile(url) {
+  try {
+    const response = await fetch(url, { credentials: 'include' });
+    if (!response.ok) return null;
+    const blob = await response.blob();
+    let type = (blob.type || '').split(';')[0].toLowerCase();
+    if (!IMAGE_EXTENSIONS[type]) {
+      // Some servers label images as binary data: accept it if it decodes
+      const bitmap = await createImageBitmap(blob).catch(() => null);
+      if (!bitmap) return null;
+      bitmap.close();
+      const fromUrl = (url.match(/\.(jpe?g|png|webp|gif|avif|bmp)(?:[?#]|$)/i) || [])[1];
+      type = fromUrl ? `image/${fromUrl.toLowerCase().replace('jpg', 'jpeg')}` : 'image/png';
+    }
+    return { blob, ext: IMAGE_EXTENSIONS[type] || 'png' };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function saveImageFile({ blob, ext }, prefix, number, suffix) {
+  const numbered = number.toString().padStart(3, '0');
+  const filename = `${prefix ? `${prefix}_` : ''}${numbered}${suffix}.${ext}`;
+  await chrome.downloads.download({
+    url: await blobToDataUrl(blob),
+    filename: currentSubfolder ? `${currentSubfolder}/${filename}` : filename,
+    saveAs: false
+  });
+  if (state.createPdf) {
+    // SVGs (and anything else the worker can't decode) stay out of the PDF
+    const bitmap = await createImageBitmap(blob).catch(() => null);
+    if (bitmap) {
+      const { width, height } = bitmap;
+      bitmap.close();
+      await pdfStore.addPage({ blob, width, height });
+    }
+  }
+}
+
 function comparesCaptures() {
   return state.skipDuplicates || state.autoStopUnchanged;
 }
@@ -548,6 +649,11 @@ function signaturesMatch(a, b) {
   if (a.length !== b.length) return false;
   let changed = 0;
   for (let i = 0; i < a.length; i++) {
+    if (a[i].urls !== undefined || b[i].urls !== undefined) {
+      // Saved image files: compared by their URLs
+      if (a[i].urls !== b[i].urls) return false;
+      continue;
+    }
     if (a[i].w !== b[i].w || a[i].h !== b[i].h) return false;
     const da = a[i].data;
     const db = b[i].data;

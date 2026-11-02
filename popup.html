@@ -88,6 +88,25 @@
               <span data-i18n="areaRatioFree">Free</span>
             </button>
           </div>
+          <!-- Picked element: save its image files, or a screenshot of it -->
+          <div class="segmented-control element-save-group" id="elementSaveGroup" style="display: none;">
+            <button class="segment-btn" data-save="images" title="Save the image files in the element, from their URLs" data-i18n-title="saveImagesTip">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <polyline points="21 15 16 10 5 21"/>
+              </svg>
+              <span data-i18n="saveImages">Images</span>
+              <span id="elementImageCount"></span>
+            </button>
+            <button class="segment-btn" data-save="screenshot" title="Save one screenshot of the whole element" data-i18n-title="saveScreenshotTip">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                <circle cx="12" cy="13" r="4"/>
+              </svg>
+              <span data-i18n="saveScreenshot">Screenshot</span>
+            </button>
+          </div>
         </div>
 
         <div class="divider"></div>

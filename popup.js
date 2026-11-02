@@ -26,6 +26,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const captureModeGroup     = document.getElementById('captureModeGroup');
   const modeStatus           = document.getElementById('modeStatus');
   const zoomMultiplierGroup  = document.getElementById('zoomMultiplierGroup');
+  const elementSaveGroup     = document.getElementById('elementSaveGroup');
+  const elementImageCount    = document.getElementById('elementImageCount');
   const btnSave     = document.getElementById('btnSave');
   const btnDelete   = document.getElementById('btnDelete');
   const btnRename   = document.getElementById('btnRename');
@@ -249,6 +251,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  elementSaveGroup.querySelectorAll('.segment-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      chrome.runtime.sendMessage({ command: 'updateOption', key: 'elementSaveMode', value: btn.dataset.save }, (response) => {
+        if (response) updateUI(response);
+      });
+    });
+  });
+
   zoomMultiplierGroup.querySelectorAll('.segment-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const value = parseInt(btn.dataset.multiplier, 10);
@@ -363,6 +373,15 @@ document.addEventListener('DOMContentLoaded', () => {
       areaStatus.textContent = t('fullPage');
     }
     if (!state.captureElement) areaStatus.removeAttribute('title');
+
+    // Save as image files or a screenshot, for a picked element only
+    elementSaveGroup.style.display = state.captureElement ? 'flex' : 'none';
+    if (state.captureElement) {
+      elementImageCount.textContent = `(${state.captureElement.imageCount || 0})`;
+      elementSaveGroup.querySelectorAll('.segment-btn').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.save === (state.elementSaveMode || 'images'));
+      });
+    }
 
     // Global state modes
     if (state.isSelectingArea) {
