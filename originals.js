@@ -60,10 +60,22 @@ function siteRules(u) {
   const out = [];
   const path = u.pathname;
 
-  // Naver (blogs, cafes, news): ?type=w773 / w80_blur picks a resized copy
+  // Naver (blogs, cafes, news): ?type=w773 / w80_blur picks a resized copy.
+  // Checked against live posts: blogfiles. serves the uploaded file as is,
+  // and type=w3840 the largest copy (capped at the original's size). With
+  // no type at all postfiles. gives a 100px thumbnail -- but profile
+  // pictures (blogpfthumb-phinf.) give their original that way.
   if (hostIs(u, 'pstatic.net') && u.searchParams.has('type')) {
+    if (u.hostname === 'postfiles.pstatic.net') {
+      out.push(edited(u, (c) => { c.hostname = 'blogfiles.pstatic.net'; c.search = ''; }));
+    }
+    out.push(edited(u, (c) => c.searchParams.set('type', 'w3840')));
     out.push(edited(u, (c) => c.searchParams.delete('type')));
-    out.push(edited(u, (c) => c.searchParams.set('type', 'w2')));
+  }
+  // Naver's thumbnail proxy for outside images: ?src="<original URL>"
+  if ((u.hostname === 'dthumb-phinf.pstatic.net' || u.hostname === 'search.pstatic.net') && u.searchParams.get('src')) {
+    const inner = parseUrl(u.searchParams.get('src').replace(/^"|"$/g, ''));
+    if (inner) out.push(inner.href, ...siteRules(inner));
   }
 
   // Daum / Tistory thumbnails wrap the original's URL in ?fname=
@@ -102,14 +114,23 @@ function siteRules(u) {
     out.push(`https://i.redd.it${path}`);
   }
 
-  // Imgur: <7-char id> + size letter (s, b, t, m, l, h) -> the id alone
+  // Imgur: <id>_d.jpg?maxwidth=800&shape=thumb, or a 7-char id + size
+  // letter (s, b, t, m, l, h) -> the id alone
   if (u.hostname === 'i.imgur.com') {
-    const m = path.match(/^\/([a-zA-Z0-9]{7})[sbtmlh](\.\w+)$/);
+    const m = path.match(/^\/([a-zA-Z0-9]{5,7})(?:_[a-z]+|(?<=^\/[a-zA-Z0-9]{7})[sbtmlh])?(\.\w+)$/);
     if (m) out.push(`https://i.imgur.com/${m[1]}${m[2]}`);
   }
 
-  // Wikimedia: /thumb/a/ab/File.jpg/220px-File.jpg -> /a/ab/File.jpg
-  if (u.hostname === 'upload.wikimedia.org' && path.includes('/thumb/')) {
+  // YouTube thumbnails: default / mqdefault / hqdefault / sddefault -> maxresdefault
+  if (hostIs(u, 'ytimg.com') && /\/(default|mqdefault|hqdefault|sddefault|hq720)\.(jpg|webp)$/.test(path)) {
+    out.push(edited(u, (c) => {
+      c.pathname = path.replace(/\/\w+\.(jpg|webp)$/, '/maxresdefault.$1');
+      c.search = '';
+    }));
+  }
+
+  // Wikimedia (upload. or thumb.): /thumb/a/ab/File.jpg/220px-File.jpg -> /a/ab/File.jpg
+  if ((u.hostname === 'upload.wikimedia.org' || u.hostname === 'thumb.wikimedia.org') && path.includes('/thumb/')) {
     const m = path.match(/^(.*)\/thumb\/(.+?)\/[^/]+$/);
     if (m) out.push(`https://upload.wikimedia.org${m[1]}/${m[2]}`);
   }

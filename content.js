@@ -647,7 +647,7 @@
       seen.add(url);
       found.push({ node, url });
     };
-    for (const node of [root, ...root.querySelectorAll('*')]) {
+    for (const node of elementsIn(root)) {
       const r = node.getBoundingClientRect();
       const bigEnough = r.width >= MIN_IMAGE_PX && r.height >= MIN_IMAGE_PX;
       if (node.tagName === 'IMG') {
@@ -662,6 +662,19 @@
       }
     }
     return found;
+  }
+
+  // root and everything under it, including inside open shadow roots
+  // (web components, e.g. Reddit's)
+  function elementsIn(root) {
+    const out = [];
+    const visit = (el) => {
+      out.push(el);
+      if (el.shadowRoot) for (const child of el.shadowRoot.children) visit(child);
+      for (const child of el.children) visit(child);
+    };
+    visit(root);
+    return out;
   }
 
   function hasLazySource(img) {

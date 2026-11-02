@@ -547,10 +547,14 @@ async function saveElementImages(tabs, tabId, prefix) {
   }
 
   const number = ++captureCount;
-  for (const [i, image] of list.entries()) {
+  let fileCount = 0;
+  for (const image of list) {
     if (!state.isPlaying) break;
-    const suffix = '_' + String(i + 1).padStart(2, '0');
     const file = await fetchBestImage(image);
+    if (file && file.width && (file.width < MIN_SAVED_IMAGE_PX || file.height < MIN_SAVED_IMAGE_PX)) {
+      continue; // layout decoration, not a picture
+    }
+    const suffix = '_' + String(++fileCount).padStart(2, '0');
     if (file) {
       await saveImageFile(file, prefix, number, suffix);
     } else {
@@ -574,6 +578,7 @@ async function saveElementImages(tabs, tabId, prefix) {
 // image with more pixels than the page's, and -- for a generic guess -- the
 // same shape, so a wrong guess can never make the result worse.
 const ORIGINAL_ASPECT_TOLERANCE = 0.03; // generic guesses must keep the aspect ratio within 3%
+const MIN_SAVED_IMAGE_PX = 48;          // smaller files (spacers, 1px background strips) aren't saved
 
 async function fetchBestImage(image) {
   if (!image.url) return null;
@@ -604,10 +609,23 @@ const IMAGE_EXTENSIONS = {
 
 // The image's original bytes, or null if the URL doesn't give an image.
 // Sent with the browser's cookies, so images behind a login still load.
+const FETCH_RETRY_MAX_WAIT = 5000; // ms, longest Retry-After honored when a site says "too many requests"
+
 async function fetchImageFile(url) {
   try {
-    const response = await fetch(url, { credentials: 'include' });
+    let response = await fetch(url, { credentials: 'include' });
+    if (response.status === 429 || response.status === 503) {
+      // Rate limited (e.g. Wikimedia): one polite retry
+      const retryAfter = parseFloat(response.headers.get('retry-after')) * 1000;
+      await sleep(Math.min(FETCH_RETRY_MAX_WAIT, retryAfter > 0 ? retryAfter : 1500));
+      response = await fetch(url, { credentials: 'include' });
+    }
     if (!response.ok) return null;
+    // A web page (e.g. a link to an image's description page): not read
+    if (/^text\//i.test(response.headers.get('content-type') || '')) {
+      response.body && response.body.cancel().catch(() => {});
+      return null;
+    }
     const blob = await response.blob();
     let type = (blob.type || '').split(';')[0].toLowerCase();
     // Decoded for its size (to compare with originals); SVGs can't be, and keep 0
