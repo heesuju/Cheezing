@@ -189,6 +189,16 @@
               </button>
             </div>
 
+            <!-- Steps of the selected recording, and adding a click step with the picker -->
+            <div id="stepList" class="step-list" style="display:none;"></div>
+            <button id="btnAddClickStep" class="btn secondary small add-step-btn" title="Pick an element on the page for the macro to click (e.g. a Next button)" data-i18n-title="addClickStepTip">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v5"/>
+                <path d="M13 13l8 3-3.5 1.5L16 21z"/>
+              </svg>
+              <span data-i18n="addClickStep">Add click on element</span>
+            </button>
+
             <!-- Record section: shown when New is selected -->
             <div id="recordSection">
               <div class="macro-stat">
@@ -332,6 +342,21 @@
           </label>
           <label class="toggle-switch">
             <input type="checkbox" id="findOriginalsCheckbox" checked>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <!-- Macro Clicks By Element -->
+        <div class="setting-group toggle-row">
+          <label class="setting-label" for="clickByElementCheckbox">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v5"/>
+              <path d="M13 13l8 3-3.5 1.5L16 21z"/>
+            </svg>
+            <span data-i18n="clickByElementLabel">Macro clicks find the clicked element (stop when it's gone)</span>
+          </label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="clickByElementCheckbox" checked>
             <span class="toggle-slider"></span>
           </label>
         </div>

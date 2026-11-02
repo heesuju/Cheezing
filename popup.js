@@ -24,6 +24,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const maxStripTilesInput   = document.getElementById('maxStripTilesInput');
   const elementWaitInput     = document.getElementById('elementWaitInput');
   const findOriginalsCheckbox = document.getElementById('findOriginalsCheckbox');
+  const clickByElementCheckbox = document.getElementById('clickByElementCheckbox');
+  const stepList = document.getElementById('stepList');
+  const btnAddClickStep = document.getElementById('btnAddClickStep');
   const captureModeGroup     = document.getElementById('captureModeGroup');
   const modeStatus           = document.getElementById('modeStatus');
   const zoomMultiplierGroup  = document.getElementById('zoomMultiplierGroup');
@@ -311,6 +314,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.activeElement !== maxStripTilesInput) {
       maxStripTilesInput.value = state.maxStripTiles ?? 2000;
     }
+    if (document.activeElement !== clickByElementCheckbox) {
+      clickByElementCheckbox.checked = state.clickByElement !== false;
+    }
+    renderSteps(state);
+    btnAddClickStep.disabled = !!(state.isPlaying || state.isRecording || state.isSelectingArea);
     if (document.activeElement !== findOriginalsCheckbox) {
       findOriginalsCheckbox.checked = state.findOriginals !== false;
     }
@@ -499,6 +507,51 @@ document.addEventListener('DOMContentLoaded', () => {
     const value = Math.max(0, parseInt(maxStripTilesInput.value, 10) || 0);
     maxStripTilesInput.value = value;
     chrome.runtime.sendMessage({ command: 'updateOption', key: 'maxStripTiles', value });
+  });
+
+  // The selected recording's steps, e.g. "1  Click a "Next"", "2  Key Enter"
+  function renderSteps(state) {
+    const actions = state.actions || [];
+    stepList.style.display = actions.length ? 'flex' : 'none';
+    const locked = !!(state.isPlaying || state.isRecording);
+    stepList.textContent = '';
+    actions.forEach((action, i) => {
+      const row = document.createElement('div');
+      row.className = 'step-row';
+      const num = document.createElement('span');
+      num.className = 'step-num';
+      num.textContent = i + 1;
+      const label = document.createElement('span');
+      label.className = 'step-label';
+      if (action.type === 'click') {
+        label.textContent = `${t('stepClick')} ${action.target ? action.target.label : `(${Math.round(action.x)}, ${Math.round(action.y)})`}`;
+      } else {
+        label.textContent = `${t('stepKey')} ${action.key === ' ' ? 'Space' : action.key}`;
+      }
+      label.title = label.textContent;
+      const remove = document.createElement('button');
+      remove.className = 'step-remove';
+      remove.textContent = '×';
+      remove.title = t('removeStep');
+      remove.disabled = locked;
+      remove.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ command: 'removeAction', index: i }, (response) => {
+          if (response) updateUI(response);
+        });
+      });
+      row.append(num, label, remove);
+      stepList.appendChild(row);
+    });
+    if (state.isRecording) stepList.scrollTop = stepList.scrollHeight;
+  }
+
+  btnAddClickStep.addEventListener('click', () => {
+    // Pick right away; close the popup so the page can be pointed at
+    chrome.runtime.sendMessage({ command: 'startPickingElement', purpose: 'click' }, () => window.close());
+  });
+
+  clickByElementCheckbox.addEventListener('change', () => {
+    chrome.runtime.sendMessage({ command: 'updateOption', key: 'clickByElement', value: clickByElementCheckbox.checked });
   });
 
   findOriginalsCheckbox.addEventListener('change', () => {

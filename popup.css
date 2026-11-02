@@ -423,6 +423,65 @@ select {
   gap: 8px;
 }
 
+.step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 132px;
+  overflow-y: auto;
+  margin-bottom: 6px;
+  scrollbar-width: thin;
+}
+
+.step-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 8px;
+  border-radius: 5px;
+  background: var(--input-bg);
+  font-size: 0.75rem;
+  color: var(--text-color);
+}
+
+.step-num {
+  color: var(--text-muted);
+  min-width: 14px;
+}
+
+.step-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.9rem;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+
+.step-remove:hover:not(:disabled) {
+  color: var(--text-color);
+  background: var(--bg-surface-hover);
+}
+
+.add-step-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
 .macro-stat {
   display: flex;
   align-items: center;

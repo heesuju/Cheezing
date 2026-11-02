@@ -43,7 +43,7 @@
       startSelection(message.ratio);
       sendResponse({ success: true });
     } else if (message.command === 'startPickingElement') {
-      startElementPicker();
+      startElementPicker(message.purpose || 'capture');
       sendResponse({ success: true });
     } else if (message.command === 'clearArea') {
       removeRectBox();
@@ -57,6 +57,8 @@
       if (captureRectDiv) captureRectDiv.style.display = 'block';
       if (elementOutline) elementOutline.hidden = false;
       sendResponse({ success: true });
+    } else if (message.command === 'locateClickTarget') {
+      sendResponse(locateClickTarget(message.target, message.hint));
     } else if (message.command === 'findPickedElement') {
       sendResponse(describePickedElement(message.element));
     } else if (message.command === 'collectElementImages') {
@@ -594,13 +596,18 @@
     return !!id && !/[:\s]|\d{3,}|^\d/.test(id) && !/[0-9a-f]{8,}/i.test(id);
   }
 
-  // e.g. "div#content", "article.post-body", "iframe"
+  const GENERIC_CLASS = /^(btn|button|icon|link|item|wrapper|container|inner|outer|row|col|box|clearfix)$/i;
+
+  // e.g. "div#content", "article.post-body", "button.pager-next"
   function describeElement(el) {
     let label = el.tagName.toLowerCase();
     if (isStableId(el.id)) {
       label += '#' + el.id;
-    } else if (typeof el.className === 'string' && el.className.trim()) {
-      label += '.' + el.className.trim().split(/\s+/)[0];
+    } else if (el.classList.length) {
+      // The most telling class: not a generic one like "btn", nor a state
+      const classes = [...el.classList];
+      const specific = classes.find((c) => !GENERIC_CLASS.test(c) && !STATE_CLASS.test(c));
+      label += '.' + (specific || classes[0]);
     }
     return label.length > 32 ? label.slice(0, 31) + '…' : label;
   }
@@ -820,13 +827,136 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  // ── Click targets (macro clicks by element) ─────────────────────────
+  // A macro click remembers the element it hit: its CSS path, plus its
+  // text (or label) or classes as a fingerprint. The path alone isn't
+  // enough -- in pagination "Next" is the 6th link on one page and the 7th
+  // on another -- so the path is used only when the fingerprint agrees,
+  // and otherwise the matching element nearest the recorded spot is used.
+  const CLICKABLE = 'a[href], button, input, select, textarea, label, summary, ' +
+    '[role="button"], [role="link"], [role="tab"], [role="menuitem"], [onclick]';
+  const MAX_NAME_LENGTH = 60;
+  const STATE_CLASS = /active|selected|current|disabled|hover|focus|^on$|^is-|^has-/i;
+
+  // The control a click landed in (an icon inside a button -> the button)
+  function clickableOf(el) {
+    return el.closest(CLICKABLE) || el;
+  }
+
+  function buildClickTarget(el, point) {
+    const ref = buildElementRef(el, false);
+    const name = accessibleName(el);
+    const target = {
+      selector: ref.selector,
+      frames: ref.frames,
+      tag: el.tagName.toLowerCase(),
+      name,
+      cls: classKey(el),
+      label: name ? `${el.tagName.toLowerCase()} "${name.length > 24 ? name.slice(0, 23) + '…' : name}"` : ref.label
+    };
+    const box = elementBox(el);
+    if (point && box.width > 0 && box.height > 0) {
+      // Where in the element the click was, as fractions of its size
+      target.fx = Math.min(1, Math.max(0, (point.x - box.x) / box.width));
+      target.fy = Math.min(1, Math.max(0, (point.y - box.y) / box.height));
+    }
+    return target;
+  }
+
+  // Short visible name: aria-label, text, value, title or an image's alt.
+  // Long text (a whole card) is no fingerprint, so it's left empty.
+  function accessibleName(el) {
+    const img = el.querySelector && el.querySelector('img[alt]');
+    const raw = el.getAttribute('aria-label') || el.textContent ||
+      (el.tagName === 'INPUT' ? el.value : '') || el.getAttribute('title') || (img ? img.alt : '') || '';
+    const name = raw.replace(/\s+/g, ' ').trim();
+    return name.length > MAX_NAME_LENGTH ? '' : name;
+  }
+
+  // The element's classes minus state ones (active, disabled...), sorted
+  function classKey(el) {
+    return [...el.classList].filter((c) => !STATE_CLASS.test(c)).sort().join(' ');
+  }
+
+  function isShown(el) {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && viewOf(el).getComputedStyle(el).visibility !== 'hidden';
+  }
+
+  function isDisabled(el) {
+    if (el.disabled || el.closest('[disabled], [aria-disabled="true"]')) return true;
+    return [...el.classList].some((c) => /(^|[-_])disabled$/i.test(c));
+  }
+
+  function findClickTarget(target, hint) {
+    let doc = document;
+    try {
+      for (const frameSelector of target.frames || []) {
+        const frame = doc.querySelector(frameSelector);
+        doc = frame && frameDocument(frame);
+        if (!doc) return null;
+      }
+    } catch (err) {
+      return null;
+    }
+    const matches = (el) => target.name ? accessibleName(el) === target.name
+      : target.cls ? classKey(el) === target.cls
+      : true;
+
+    let bySelector = null;
+    try {
+      bySelector = doc.querySelector(target.selector);
+    } catch (err) { /* not a valid selector */ }
+    if (bySelector && isShown(bySelector) && matches(bySelector)) return bySelector;
+    if (!target.name && !target.cls) return null;
+
+    // Path points elsewhere now: the matching element nearest the recorded spot
+    let best = null;
+    let bestDistance = Infinity;
+    for (const el of doc.querySelectorAll(target.tag || '*')) {
+      if (!matches(el) || !isShown(el)) continue;
+      const b = elementBox(el);
+      const d = hint ? Math.hypot(b.x + b.width / 2 - hint.x, b.y + b.height / 2 - hint.y) : 0;
+      if (d < bestDistance) {
+        best = el;
+        bestDistance = d;
+      }
+    }
+    return best;
+  }
+
+  // Where to click the target now, in top-frame px, scrolling it into view
+  // first if needed
+  function locateClickTarget(target, hint) {
+    const el = findClickTarget(target, hint);
+    if (!el) return { found: false };
+    const view = windowRegion();
+    let box = elementBox(el);
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    if (cx < 0 || cy < 0 || cx > view.width || cy > view.height) {
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+      box = elementBox(el);
+    }
+    const fx = typeof target.fx === 'number' ? target.fx : 0.5;
+    const fy = typeof target.fy === 'number' ? target.fy : 0.5;
+    return {
+      found: true,
+      disabled: isDisabled(el),
+      x: box.x + box.width * fx,
+      y: box.y + box.height * fy
+    };
+  }
+
   // ── Element picker ──────────────────────────────────────────────────
   // Hover highlights the element under the mouse (in same-origin frames
   // too), click picks it. ↑ widens the pick to the parent, ↓ steps back
   // down, Esc cancels. The page doesn't see the clicks while picking.
   let picker = null;
 
-  function startElementPicker() {
+  // purpose 'capture' picks the capture element; 'click' picks an element
+  // for a macro step to click
+  function startElementPicker(purpose = 'capture') {
     if (picker) return;
     // Hide the current area while picking; restored if cancelled
     if (captureRectDiv) captureRectDiv.style.display = 'none';
@@ -850,16 +980,19 @@
       pointerEvents: 'none',
       whiteSpace: 'nowrap'
     });
-    hint.textContent = 'Click an element to capture · ↑ larger · ↓ smaller · Esc to cancel';
+    const forClick = purpose === 'click';
+    hint.textContent = (forClick ? 'Click the element the macro should click' : 'Click an element to capture') +
+      ' · ↑ larger · ↓ smaller · Esc to cancel';
     chrome.storage.local.get('settings', ({ settings }) => {
       if (settings && settings.language === 'ko') {
-        hint.textContent = '캡처할 요소를 클릭 · ↑ 더 크게 · ↓ 더 작게 · Esc 취소';
+        hint.textContent = (forClick ? '매크로가 클릭할 요소를 클릭' : '캡처할 요소를 클릭') +
+          ' · ↑ 더 크게 · ↓ 더 작게 · Esc 취소';
       }
     });
     document.documentElement.appendChild(box.root);
     document.documentElement.appendChild(hint);
 
-    picker = { box, hint, hovered: null, current: null, trail: [], docs: [], raf: 0 };
+    picker = { box, hint, purpose, hovered: null, current: null, trail: [], docs: [], raf: 0 };
 
     const blockEvent = (e) => {
       e.preventDefault();
@@ -923,7 +1056,7 @@
       if (el && el.isConnected) {
         if (countedFor !== el) {
           countedFor = el;
-          imageNote = imageCountNote(findElementImages(el).length);
+          imageNote = forClick ? '' : imageCountNote(findElementImages(el).length);
         }
         const r = el.getBoundingClientRect();
         placeOverlayBox(box, elementBox(el), `${describeElement(el)}  ${Math.round(r.width)}×${Math.round(r.height)}${imageNote}`);
@@ -957,6 +1090,20 @@
   }
 
   function pick(el) {
+    if (picker.purpose === 'click') {
+      el = clickableOf(el);
+      finishPicker();
+      if (captureRectDiv && currentRect) captureRectDiv.style.display = 'block';
+      if (elementOutline) elementOutline.hidden = false;
+      const box = elementBox(el);
+      const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      chrome.runtime.sendMessage({
+        command: 'elementSelected',
+        purpose: 'click',
+        element: { target: buildClickTarget(el, center), x: center.x, y: center.y }
+      });
+      return;
+    }
     const ref = buildElementRef(el);
     finishPicker();
     // The element replaces a drawn area
@@ -1094,16 +1241,22 @@
   function recordMouseDown(e, doc) {
     if (!isRecording) return;
     const o = frameOffset(viewOf(doc));
+    const x = e.clientX + o.x;
+    const y = e.clientY + o.y;
+    let target = null;
+    if (e.target && e.target.nodeType === 1) {
+      try {
+        target = buildClickTarget(clickableOf(e.target), { x, y });
+      } catch (err) {
+        target = null; // coordinates alone still replay
+      }
+    }
 
-    // Send the click coordinates to the background script
+    // The click's position, and the element clicked so playback can find it
+    // again wherever it has moved
     chrome.runtime.sendMessage({
       command: 'recordAction',
-      action: {
-        type: 'click',
-        x: e.clientX + o.x,
-        y: e.clientY + o.y,
-        timestamp: Date.now()
-      }
+      action: { type: 'click', x, y, target, timestamp: Date.now() }
     });
   }
 

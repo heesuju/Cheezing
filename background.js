@@ -25,7 +25,8 @@ let state = {
   zoomMultiplier: 4,      // 2 | 3 | 4 -- Hi-Res resolution multiplier (Settings)
   maxStripTiles: 2000,    // Long: max scroll steps per capture, 0 = no limit (Settings)
   elementWait: 1,         // Element: seconds to wait for the element to finish loading (Settings)
-  findOriginals: true     // Element images: try URLs for the full-size original (Settings)
+  findOriginals: true,    // Element images: try URLs for the full-size original (Settings)
+  clickByElement: true    // Macro clicks find the clicked element again, not its old position (Settings)
 };
 
 const ZOOM_ATTACH_SETTLE_DELAY = 300; // ms for the page to repaint after the debugger bar appears
@@ -43,12 +44,14 @@ const ELEMENT_WAIT_TIMEOUT = 10000; // ms to wait for a picked element to show u
 const ELEMENT_STABLE_MS = 500;      // ms its size must hold before it counts as loaded
 const ELEMENT_MISSING_STOP_COUNT = 3; // macro steps in a row without the element before the run stops
 const STEP_IMAGE_WAIT = 2000;       // max ms per Element capture step for images in view to load
+const CLICK_TARGET_WAIT = 8000;     // ms a macro click waits for its element to show up / be enabled
+const PICKED_STEP_DELAY = 500;      // ms before a click step added with the picker
 
 // Settings that must survive Chrome shutting the service worker down when
 // idle (which resets everything in memory). Messages wait for this to load.
 const PERSISTED_KEYS = [
   'longCapture', 'hiRes', 'zoomMultiplier', 'createPdf', 'captureFirst', 'skipDuplicates',
-  'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'findOriginals', 'macroEnabled', 'prefix', 'activeRecordingName'
+  'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'findOriginals', 'clickByElement', 'macroEnabled', 'prefix', 'activeRecordingName'
 ];
 
 const stateReady = chrome.storage.local.get(['savedRecordings', 'options']).then(({ savedRecordings, options }) => {
@@ -201,6 +204,22 @@ async function onDebuggerDetach(source, reason) {
   saveOptions();
 }
 
+// A "click this element" step picked on the page, added to the selected
+// recording (or a new one, saved and selected)
+function addClickStep({ target, x, y }) {
+  const action = { type: 'click', x, y, target, delay: PICKED_STEP_DELAY };
+  if (!state.activeRecordingName) {
+    const name = generateRecordingName();
+    state.actions = [...state.actions, action];
+    state.savedRecordings[name] = state.actions;
+    state.activeRecordingName = name;
+  } else {
+    state.actions.push(action);
+  }
+  state.macroEnabled = true;
+  chrome.storage.local.set({ savedRecordings: state.savedRecordings });
+}
+
 function handleMessage(message, sender, sendResponse) {
   if (message.command === 'getState') {
     sendResponse(state);
@@ -267,6 +286,7 @@ function handleMessage(message, sender, sendResponse) {
     sendResponse(state);
   } else if (message.command === 'startPickingElement') {
     state.isSelectingArea = true;
+    const purpose = message.purpose || 'capture';
     broadcastState();
 
     chrome.tabs.query({active: true, lastFocusedWindow: true}, function(tabs) {
@@ -276,12 +296,24 @@ function handleMessage(message, sender, sendResponse) {
         target: { tabId: tabs[0].id },
         files: ['content.js']
       }).then(() => {
-        chrome.tabs.sendMessage(tabs[0].id, { command: 'startPickingElement' }).catch(() => {});
+        chrome.tabs.sendMessage(tabs[0].id, { command: 'startPickingElement', purpose }).catch(() => {});
       }).catch(() => {
         state.isSelectingArea = false;
         broadcastState();
       });
     });
+    sendResponse(state);
+  } else if (message.command === 'elementSelected' && message.purpose === 'click') {
+    state.isSelectingArea = false;
+    addClickStep(message.element);
+    broadcastState();
+    sendResponse(state);
+  } else if (message.command === 'removeAction') {
+    if (!state.isPlaying && !state.isRecording && state.actions[message.index]) {
+      state.actions.splice(message.index, 1);
+      if (state.activeRecordingName) chrome.storage.local.set({ savedRecordings: state.savedRecordings });
+      broadcastState();
+    }
     sendResponse(state);
   } else if (message.command === 'elementSelected') {
     state.isSelectingArea = false;
@@ -361,7 +393,7 @@ function handleMessage(message, sender, sendResponse) {
     state.createPdf = message.createPdf;
     sendResponse(state);
   } else if (message.command === 'updateOption') {
-    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'elementSaveMode', 'findOriginals', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
+    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'elementSaveMode', 'findOriginals', 'clickByElement', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
       state[message.key] = message.value;
     }
     sendResponse(state);
@@ -799,10 +831,15 @@ async function getStrings() {
   return I18N[(settings && settings.language) || 'en'] || I18N.en;
 }
 
-async function showFinishedNotification(reason) {
+async function showFinishedNotification(reason, label = '') {
   const strings = await getStrings();
-  const messages = { max: strings.finishedMax, unchanged: strings.finishedUnchanged, elementMissing: strings.elementMissingMessage };
-  const message = messages[reason].replace('{n}', state.runSaved);
+  const messages = {
+    max: strings.finishedMax,
+    unchanged: strings.finishedUnchanged,
+    elementMissing: strings.elementMissingMessage,
+    targetGone: strings.finishedTargetGone
+  };
+  const message = messages[reason].replace('{n}', state.runSaved).replace('{label}', label);
   chrome.notifications.create('capture-finished', {
     type: 'basic',
     iconUrl: DEFAULT_ICON[128],
@@ -1451,18 +1488,32 @@ async function startPlayback(prefix) {
       if (!state.isPlaying) break;
 
       if (action.type === 'click') {
+        const point = await resolveClickPoint(tabId, action);
+        if (!point) {
+          // The element to click is gone or disabled (e.g. "Next" on the last page)
+          if (state.isPlaying) {
+            state.isPlaying = false;
+            showFinishedNotification('targetGone', action.target.label);
+          }
+          break;
+        }
+        // Moved over first, for controls that react to hover
+        await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+          type: 'mouseMoved', x: point.x, y: point.y
+        }).catch(() => {});
+
         await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
           type: 'mousePressed',
-          x: action.x,
-          y: action.y,
+          x: point.x,
+          y: point.y,
           button: 'left',
           clickCount: 1
         }).catch(() => {});
 
         await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
           type: 'mouseReleased',
-          x: action.x,
-          y: action.y,
+          x: point.x,
+          y: point.y,
           button: 'left',
           clickCount: 1
         }).catch(() => {});
@@ -1491,6 +1542,31 @@ async function startPlayback(prefix) {
   await chrome.tabs.sendMessage(tabId, { command: 'setRectLocked', locked: false }).catch(() => {});
   await chrome.debugger.detach(target).catch(() => {});
   await endPlayback();
+}
+
+// Where to click: the recorded element wherever it is now, waiting for it
+// to appear and be enabled; or the recorded position, for clicks recorded
+// before elements were remembered or with the setting off. Returns null if
+// the element never turned up.
+async function resolveClickPoint(tabId, action) {
+  if (!action.target || !state.clickByElement) return { x: action.x, y: action.y };
+  const start = Date.now();
+  while (state.isPlaying) {
+    // Re-injected in case the macro navigated to a new page
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
+    const found = await chrome.tabs.sendMessage(tabId, {
+      command: 'locateClickTarget',
+      target: action.target,
+      hint: { x: action.x, y: action.y }
+    }).catch(() => null);
+    if (found && found.found && !found.disabled) {
+      await sleep(100); // let a scroll into view settle
+      return { x: found.x, y: found.y };
+    }
+    if (Date.now() - start >= CLICK_TARGET_WAIT) return null;
+    await sleep(SETTLE_POLL_INTERVAL);
+  }
+  return null;
 }
 
 async function dispatchKeyAction(target, action) {
