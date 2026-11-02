@@ -18,6 +18,8 @@
       rectLocked = !!response.isPlaying;
       if (response.captureRect) {
         drawPersistentRect(response.captureRect);
+      } else if (response.captureElement) {
+        showElementOutline(response.captureElement, null);
       }
     }
   });
@@ -40,19 +42,23 @@
     } else if (message.command === 'startSelectingArea') {
       startSelection(message.ratio);
       sendResponse({ success: true });
+    } else if (message.command === 'startPickingElement') {
+      startElementPicker();
+      sendResponse({ success: true });
     } else if (message.command === 'clearArea') {
-      if (captureRectDiv) {
-        captureRectDiv.remove();
-        captureRectDiv = null;
-        currentRect = null;
-      }
+      removeRectBox();
+      clearElementOutline();
       sendResponse({ success: true });
     } else if (message.command === 'hideRect') {
       if (captureRectDiv) captureRectDiv.style.display = 'none';
+      if (elementOutline) elementOutline.hidden = true;
       sendResponse({ success: true });
     } else if (message.command === 'showRect') {
       if (captureRectDiv) captureRectDiv.style.display = 'block';
+      if (elementOutline) elementOutline.hidden = false;
       sendResponse({ success: true });
+    } else if (message.command === 'findPickedElement') {
+      sendResponse(describePickedElement(message.element));
     } else if (message.command === 'suppressStickyElements') {
       suppressStickyElements(message.enable);
       sendResponse({ success: true });
@@ -66,9 +72,13 @@
       }
       sendResponse({ success: true });
     } else if (message.command === 'beginScrollStrip') {
-      sendResponse(beginScrollStrip(message.rect));
+      sendResponse(message.element
+        ? beginElementStrip(message.element, message.long)
+        : beginScrollStrip(message.rect));
     } else if (message.command === 'scrollStripTo') {
       sendResponse(scrollStripTo(message.y));
+    } else if (message.command === 'stripPosition') {
+      sendResponse(stripPosition());
     } else if (message.command === 'endScrollStrip') {
       endScrollStrip();
       sendResponse({ success: true });
@@ -184,9 +194,10 @@
     }
     const scroller = stripScroller || { win: window, el: null };
     const keep = scrollerChain(scroller);
+    if (stripElement) keep.nodes.push(stripElement); // e.g. a fixed dialog picked as the element
     for (const doc of keep.documents) {
       for (const el of doc.querySelectorAll('*')) {
-        if (suppressedStickyElements.has(el) || el === captureRectDiv) continue;
+        if (suppressedStickyElements.has(el) || isOwnOverlay(el)) continue;
         if (keep.nodes.some((node) => el.contains(node))) continue;
         suppressStickyElement(el);
       }
@@ -255,7 +266,9 @@
   // frame the page lives in. Positions are reported back as actually
   // reached, so the background can crop away any overlap exactly.
   let stripScroller = null;
-  let stripOrigin = null;   // scroll position to restore afterwards
+  let stripOrigin = null;   // scroll positions to restore afterwards
+  let stripRegion = null;   // the captured viewport region, in top-frame px
+  let stripElement = null;  // Element capture: the element the strip covers
 
   // Without a selected area, an inner scroller is used only if it covers at
   // least this share of the viewport, so a small scroll box that happens to
@@ -367,11 +380,9 @@
     let region = scroller ? scrollerRegion(scroller) : view;
     if (rect) region = intersect(region, rect);
 
-    stripOrigin = {
-      scroller: stripScroller,
-      top: scrollTop(stripScroller),
-      left: scrollLeft(stripScroller)
-    };
+    stripOrigin = [savedScrollPosition(stripScroller)];
+    stripRegion = region;
+    stripElement = null;
 
     return {
       region,
@@ -383,19 +394,464 @@
     };
   }
 
+  // Element capture: the strip covers one element instead of a whole
+  // scroller. Its nearest scroller (an inner panel, the page, or the frame
+  // the page lives in) is scrolled so the element passes through the
+  // scroller's visible area, and the strip's rows are the element's own rows,
+  // measured live each step -- so content loading in above it can't shift
+  // the result. With Long on and a scrollable element (a chat log, a
+  // feed...), its own contents are scrolled through instead.
+  function beginElementStrip(ref, long) {
+    const el = resolveElementRef(ref);
+    if (!el) return { notFound: true };
+    if (captureRectDiv) captureRectDiv.style.display = 'none';
+    if (elementOutline) elementOutline.hidden = true;
+
+    stripOrigin = scrollPositionsAround(el);
+    el.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'instant' });
+
+    let region;
+    if (long && isScrollable(el)) {
+      stripScroller = { win: viewOf(el), el };
+      stripElement = null;
+      region = scrollerRegion(stripScroller);
+    } else {
+      stripScroller = scrollerFor(el);
+      stripElement = el;
+      // The scroller's full visible height, narrowed to the element's columns
+      const view = scrollerRegion(stripScroller);
+      const box = elementBox(el);
+      const x = Math.max(view.x, box.x);
+      const right = Math.min(view.x + view.width, box.x + box.width);
+      region = { x, y: view.y, width: Math.max(0, right - x), height: view.height };
+    }
+    stripRegion = region;
+
+    return {
+      region,
+      innerWidth: window.innerWidth,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      element: !!stripElement
+    };
+  }
+
+  // Scrolls so that strip row `y` sits at the top of the captured region:
+  // for a scroller that's its scroll position, for an element its own row.
   function scrollStripTo(y) {
     const s = stripScroller || { win: window, el: null };
-    scrollerTo(s, y);
-    return { actual: scrollTop(s), maxScroll: maxScrollTop(s) };
+    if (stripElement) {
+      const box = elementBox(stripElement);
+      scrollerTo(s, scrollTop(s) + box.y + y - stripRegion.y);
+    } else {
+      scrollerTo(s, y);
+    }
+    return stripPosition();
+  }
+
+  // Where the strip is now: `top` is the strip row at the top of the region
+  // (negative while the element starts lower down), `end` the strip's
+  // length so far, `atEnd` whether there's nothing further to scroll to.
+  function stripPosition() {
+    const s = stripScroller || { win: window, el: null };
+    const actual = scrollTop(s);
+    const maxScroll = maxScrollTop(s);
+    if (stripElement) {
+      const box = elementBox(stripElement);
+      const top = stripRegion.y - box.y;
+      return {
+        top,
+        end: box.height,
+        maxScroll,
+        atEnd: top + stripRegion.height >= box.height - 0.5 || actual >= maxScroll - 0.5
+      };
+    }
+    return { top: actual, end: maxScroll + stripRegion.height, maxScroll, atEnd: actual >= maxScroll - 0.5 };
   }
 
   function endScrollStrip() {
     suppressStickyElements(false);
     if (stripOrigin) {
-      scrollerTo(stripOrigin.scroller, stripOrigin.top, stripOrigin.left);
+      // Innermost first, as they were saved
+      for (const { scroller, top, left } of stripOrigin) scrollerTo(scroller, top, left);
     }
+    if (elementOutline) elementOutline.hidden = false;
     stripScroller = null;
     stripOrigin = null;
+    stripRegion = null;
+    stripElement = null;
+  }
+
+  function savedScrollPosition(s) {
+    return { scroller: s, top: scrollTop(s), left: scrollLeft(s) };
+  }
+
+  // `node` and every scroller holding it, up through frames to the top
+  // page, so a scrollIntoView (or scrolling the element itself) can be
+  // undone exactly
+  function scrollPositionsAround(node) {
+    const saved = [];
+    for (;;) {
+      const win = viewOf(node);
+      for (let el = node; el; el = el.parentElement) {
+        if (el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth) {
+          if (el !== win.document.body && el !== win.document.documentElement) {
+            saved.push(savedScrollPosition({ win, el }));
+          }
+        }
+      }
+      saved.push(savedScrollPosition({ win, el: null }));
+      if (win.document === document || !win.frameElement) return saved;
+      node = win.frameElement;
+    }
+  }
+
+  // The nearest scroller that moves `el`: a scrollable ancestor, else its
+  // document -- or, for a frame document that can't scroll (sized to its
+  // content), whatever scrolls the frame in the page around it.
+  function scrollerFor(el) {
+    let node = el;
+    for (;;) {
+      const win = viewOf(node);
+      const parent = findScrollParent(node.parentElement);
+      if (parent) return { win, el: parent };
+      if (win.document === document || !win.frameElement) return { win, el: null };
+      if (maxScrollTop({ win, el: null }) > 1) return { win, el: null };
+      node = win.frameElement;
+    }
+  }
+
+  // An element's border box, in top-frame px
+  function elementBox(el) {
+    const r = el.getBoundingClientRect();
+    return offsetRegion({ x: r.left, y: r.top, width: r.width, height: r.height }, frameOffset(viewOf(el)));
+  }
+
+  // ── Picked elements ─────────────────────────────────────────────────
+  // A picked element is remembered as a CSS path (plus the path to each
+  // same-origin frame it sits in), not as a node: it's looked up again for
+  // every capture, so it's found after the page re-renders, reloads, or a
+  // macro navigates to a page with the same layout.
+  function resolveElementRef(ref) {
+    if (!ref || !ref.selector) return null;
+    try {
+      let doc = document;
+      for (const frameSelector of ref.frames || []) {
+        const frame = doc.querySelector(frameSelector);
+        doc = frame && frameDocument(frame);
+        if (!doc) return null;
+      }
+      return doc.querySelector(ref.selector);
+    } catch (err) {
+      return null; // not a valid selector
+    }
+  }
+
+  function buildElementRef(el) {
+    const frames = [];
+    let win = viewOf(el);
+    while (win.document !== document && win.frameElement) {
+      frames.unshift(cssPath(win.frameElement));
+      win = viewOf(win.frameElement);
+    }
+    const r = el.getBoundingClientRect();
+    return {
+      selector: cssPath(el),
+      frames,
+      label: describeElement(el),
+      width: Math.round(r.width),
+      height: Math.round(r.height)
+    };
+  }
+
+  // Shortest path up to an ancestor with a stable unique id, else from body,
+  // using :nth-of-type only where a tag repeats among its siblings
+  function cssPath(el) {
+    const doc = el.ownerDocument;
+    const parts = [];
+    for (let node = el; node && node !== doc.documentElement; node = node.parentElement) {
+      if (isStableId(node.id) && doc.querySelectorAll('#' + CSS.escape(node.id)).length === 1) {
+        parts.unshift('#' + CSS.escape(node.id));
+        break;
+      }
+      let part = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (parent) {
+        const same = Array.prototype.filter.call(parent.children, (c) => c.tagName === node.tagName);
+        if (same.length > 1) part += `:nth-of-type(${same.indexOf(node) + 1})`;
+      }
+      parts.unshift(part);
+    }
+    return parts.join(' > ');
+  }
+
+  // Generated ids (React's ":r1:", "ember123", hashes) change between
+  // page loads, so they can't be used to find the element again
+  function isStableId(id) {
+    return !!id && !/[:\s]|\d{3,}|^\d/.test(id) && !/[0-9a-f]{8,}/i.test(id);
+  }
+
+  // e.g. "div#content", "article.post-body", "iframe"
+  function describeElement(el) {
+    let label = el.tagName.toLowerCase();
+    if (isStableId(el.id)) {
+      label += '#' + el.id;
+    } else if (typeof el.className === 'string' && el.className.trim()) {
+      label += '.' + el.className.trim().split(/\s+/)[0];
+    }
+    return label.length > 32 ? label.slice(0, 31) + '…' : label;
+  }
+
+  // For waiting until the picked element is on the page and done loading
+  function describePickedElement(ref) {
+    const el = resolveElementRef(ref);
+    if (!el) return { found: false };
+    const box = elementBox(el);
+    let pendingImages = 0;
+    const win = viewOf(el);
+    for (const img of el.querySelectorAll('img')) {
+      if (img.complete) continue;
+      const r = img.getBoundingClientRect();
+      if (r.bottom > 0 && r.right > 0 && r.top < win.innerHeight && r.left < win.innerWidth) pendingImages++;
+    }
+    return {
+      found: true,
+      width: box.width,
+      height: box.height,
+      pendingImages,
+      msSinceMutation: getPageActivity().msSinceMutation
+    };
+  }
+
+  // ── Element picker ──────────────────────────────────────────────────
+  // Hover highlights the element under the mouse (in same-origin frames
+  // too), click picks it. ↑ widens the pick to the parent, ↓ steps back
+  // down, Esc cancels. The page doesn't see the clicks while picking.
+  let picker = null;
+
+  function startElementPicker() {
+    if (picker) return;
+    // Hide the current area while picking; restored if cancelled
+    if (captureRectDiv) captureRectDiv.style.display = 'none';
+    if (elementOutline) elementOutline.hidden = true;
+
+    const box = buildOverlayBox('#1e88e5', 'rgba(30, 136, 229, 0.15)', 'solid');
+    box.root.style.display = 'none';
+    const hint = document.createElement('div');
+    hint.dataset.cheezingOverlay = 'hint';
+    Object.assign(hint.style, {
+      position: 'fixed',
+      top: '12px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      zIndex: '10000000',
+      padding: '6px 12px',
+      borderRadius: '6px',
+      background: 'rgba(20, 20, 20, 0.85)',
+      color: '#fff',
+      font: '600 12px/1.4 sans-serif',
+      pointerEvents: 'none',
+      whiteSpace: 'nowrap'
+    });
+    hint.textContent = 'Click an element to capture · ↑ larger · ↓ smaller · Esc to cancel';
+    chrome.storage.local.get('settings', ({ settings }) => {
+      if (settings && settings.language === 'ko') {
+        hint.textContent = '캡처할 요소를 클릭 · ↑ 더 크게 · ↓ 더 작게 · Esc 취소';
+      }
+    });
+    document.documentElement.appendChild(box.root);
+    document.documentElement.appendChild(hint);
+
+    picker = { box, hint, hovered: null, current: null, trail: [], docs: [], raf: 0 };
+
+    const blockEvent = (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    };
+    const onMove = (e) => {
+      let el = e.target;
+      if (!el || el.nodeType !== 1 || isOwnOverlay(el)) return;
+      if (el === el.ownerDocument.documentElement) el = el.ownerDocument.body || el;
+      if (el === picker.hovered) return;
+      picker.hovered = el;
+      picker.trail = [];
+      picker.current = el;
+    };
+    const onClick = (e) => {
+      blockEvent(e);
+      if (picker.current) pick(picker.current);
+    };
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        blockEvent(e);
+        finishPicker();
+        if (captureRectDiv && currentRect) captureRectDiv.style.display = 'block';
+        if (elementOutline) elementOutline.hidden = false;
+        chrome.runtime.sendMessage({ command: 'areaSelectionCancelled' });
+      } else if (e.key === 'ArrowUp' && picker.current) {
+        blockEvent(e);
+        const parent = pickerParent(picker.current);
+        if (parent) {
+          picker.trail.push(picker.current);
+          picker.current = parent;
+        }
+      } else if (e.key === 'ArrowDown' && picker.trail.length) {
+        blockEvent(e);
+        picker.current = picker.trail.pop();
+      } else if (e.key === 'Enter' && picker.current) {
+        blockEvent(e);
+        pick(picker.current);
+      }
+    };
+    const listeners = [
+      ['mousemove', onMove], ['click', onClick], ['keydown', onKeyDown],
+      ['mousedown', blockEvent], ['mouseup', blockEvent], ['pointerdown', blockEvent],
+      ['pointerup', blockEvent], ['dblclick', blockEvent], ['contextmenu', blockEvent]
+    ];
+    forEachDocument((doc) => {
+      for (const [type, fn] of listeners) doc.addEventListener(type, fn, true);
+      const style = doc.createElement('style');
+      style.textContent = '* { cursor: crosshair !important; }';
+      (doc.head || doc.documentElement).appendChild(style);
+      picker.docs.push({ doc, style });
+    });
+    picker.listeners = listeners;
+
+    // Follows the highlighted element as the page scrolls or changes
+    const tick = () => {
+      if (!picker) return;
+      const el = picker.current;
+      if (el && el.isConnected) {
+        placeOverlayBox(box, elementBox(el), `${describeElement(el)}  ${Math.round(el.getBoundingClientRect().width)}×${Math.round(el.getBoundingClientRect().height)}`);
+      } else {
+        box.root.style.display = 'none';
+      }
+      picker.raf = requestAnimationFrame(tick);
+    };
+    tick();
+  }
+
+  // The element one level out, crossing from a frame's body to the frame
+  function pickerParent(el) {
+    const doc = el.ownerDocument;
+    const parent = el.parentElement;
+    if (parent && parent !== doc.documentElement) return parent;
+    const win = viewOf(el);
+    if (win.document !== document && win.frameElement) return win.frameElement;
+    return null;
+  }
+
+  function pick(el) {
+    const ref = buildElementRef(el);
+    finishPicker();
+    // The element replaces a drawn area
+    removeRectBox();
+    rectRatio = null;
+    chrome.runtime.sendMessage({ command: 'elementSelected', element: ref });
+    showElementOutline(ref, el);
+  }
+
+  function finishPicker() {
+    if (!picker) return;
+    cancelAnimationFrame(picker.raf);
+    for (const { doc, style } of picker.docs) {
+      for (const [type, fn] of picker.listeners) doc.removeEventListener(type, fn, true);
+      style.remove();
+    }
+    picker.box.root.remove();
+    picker.hint.remove();
+    picker = null;
+  }
+
+  // ── Picked element outline ──────────────────────────────────────────
+  // Shown around the picked element and kept on it as the page scrolls,
+  // resizes or re-renders. Like the area box it ignores the mouse, except
+  // for its close button, which clears the pick.
+  let elementOutline = null;
+  const OUTLINE_LOOKUP_INTERVAL = 500; // ms between lookups while the element is missing
+
+  function showElementOutline(ref, el) {
+    clearElementOutline();
+    const box = buildOverlayBox('red', 'rgba(255, 0, 0, 0.08)', 'dashed');
+    const closeBtn = buildCloseButton();
+    box.root.appendChild(closeBtn);
+    box.root.style.display = 'none';
+    document.documentElement.appendChild(box.root);
+    elementOutline = { ref, el, box, closeBtn, hidden: false, lookedUpAt: 0, raf: 0 };
+    updateRectInteractivity();
+
+    const tick = () => {
+      const o = elementOutline;
+      if (!o) return;
+      if ((!o.el || !o.el.isConnected) && Date.now() - o.lookedUpAt >= OUTLINE_LOOKUP_INTERVAL) {
+        o.el = resolveElementRef(o.ref);
+        o.lookedUpAt = Date.now();
+      }
+      if (!o.hidden && o.el && o.el.isConnected) {
+        placeOverlayBox(o.box, elementBox(o.el), o.ref.label);
+      } else {
+        o.box.root.style.display = 'none';
+      }
+      o.raf = requestAnimationFrame(tick);
+    };
+    tick();
+  }
+
+  function clearElementOutline() {
+    if (!elementOutline) return;
+    cancelAnimationFrame(elementOutline.raf);
+    elementOutline.box.root.remove();
+    elementOutline = null;
+  }
+
+  function buildOverlayBox(color, fill, borderStyle) {
+    const root = document.createElement('div');
+    root.dataset.cheezingOverlay = 'box';
+    Object.assign(root.style, {
+      position: 'fixed',
+      border: `2px ${borderStyle} ${color}`,
+      backgroundColor: fill,
+      pointerEvents: 'none',
+      zIndex: '9999999',
+      boxSizing: 'border-box'
+    });
+    const tag = document.createElement('div');
+    Object.assign(tag.style, {
+      position: 'absolute',
+      left: '-2px',
+      bottom: '100%',
+      marginBottom: '4px',
+      padding: '2px 6px',
+      background: color,
+      color: '#fff',
+      font: '600 11px/1.4 sans-serif',
+      borderRadius: '3px',
+      whiteSpace: 'pre',
+      pointerEvents: 'none'
+    });
+    root.appendChild(tag);
+    return { root, tag };
+  }
+
+  function placeOverlayBox(box, r, label) {
+    Object.assign(box.root.style, {
+      display: 'block',
+      left: r.x + 'px',
+      top: r.y + 'px',
+      width: r.width + 'px',
+      height: r.height + 'px'
+    });
+    if (box.tag.textContent !== label) box.tag.textContent = label;
+    // Inside the top edge when there's no room above it
+    const inside = r.y < 24;
+    box.tag.style.bottom = inside ? 'auto' : '100%';
+    box.tag.style.top = inside ? '2px' : 'auto';
+    box.tag.style.left = inside ? '2px' : '-2px';
+  }
+
+  function isOwnOverlay(el) {
+    if (el === captureRectDiv) return true;
+    const own = el.closest && el.closest('[data-cheezing-overlay]');
+    return !!own && own.ownerDocument === document;
   }
 
   // ── Recording ───────────────────────────────────────────────────────
@@ -532,7 +988,30 @@ function buildRectBox() {
     captureRectDiv.appendChild(handle);
   }
 
-  // Close button above the top-right corner: clears the area
+  captureRectDiv.appendChild(buildCloseButton());
+
+  // Size readout shown while dragging
+  sizeTag = document.createElement('div');
+  Object.assign(sizeTag.style, {
+    position: 'absolute',
+    left: '0',
+    bottom: '100%',
+    marginBottom: '6px',
+    padding: '2px 6px',
+    background: 'red',
+    color: '#fff',
+    font: '600 11px/1.4 sans-serif',
+    borderRadius: '3px',
+    whiteSpace: 'nowrap',
+    display: 'none'
+  });
+  captureRectDiv.appendChild(sizeTag);
+
+  document.body.appendChild(captureRectDiv);
+}
+
+// Close button above the top-right corner: clears the area (or picked element)
+function buildCloseButton() {
   const closeBtn = document.createElement('div');
   closeBtn.dataset.cheezingGrip = 'close';
   closeBtn.textContent = '×';
@@ -563,26 +1042,14 @@ function buildRectBox() {
     e.stopPropagation();
     chrome.runtime.sendMessage({ command: 'clearArea' });
   });
-  captureRectDiv.appendChild(closeBtn);
+  return closeBtn;
+}
 
-  // Size readout shown while dragging
-  sizeTag = document.createElement('div');
-  Object.assign(sizeTag.style, {
-    position: 'absolute',
-    left: '0',
-    bottom: '100%',
-    marginBottom: '6px',
-    padding: '2px 6px',
-    background: 'red',
-    color: '#fff',
-    font: '600 11px/1.4 sans-serif',
-    borderRadius: '3px',
-    whiteSpace: 'nowrap',
-    display: 'none'
-  });
-  captureRectDiv.appendChild(sizeTag);
-
-  document.body.appendChild(captureRectDiv);
+function removeRectBox() {
+  if (!captureRectDiv) return;
+  captureRectDiv.remove();
+  captureRectDiv = null;
+  currentRect = null;
 }
 
 function layoutRectBox() {
@@ -597,8 +1064,12 @@ function layoutRectBox() {
 }
 
 function updateRectInteractivity() {
-  if (!captureRectDiv) return;
   const editable = !isRecording && !rectLocked;
+  if (elementOutline) {
+    elementOutline.closeBtn.style.pointerEvents = editable ? 'auto' : 'none';
+    elementOutline.closeBtn.style.display = editable ? 'block' : 'none';
+  }
+  if (!captureRectDiv) return;
   for (const grip of captureRectDiv.querySelectorAll('[data-cheezing-grip]')) {
     const name = grip.dataset.cheezingGrip;
     // With a locked ratio only the corners resize (they keep the ratio)
@@ -687,6 +1158,7 @@ const MIN_SELECTION_SIZE = 5; // px; smaller drags count as a click, i.e. cancel
 function startSelection(ratio) {
   // Hide the current area while drawing, so its grips can't catch the drag
   if (captureRectDiv) captureRectDiv.style.display = 'none';
+  if (elementOutline) elementOutline.hidden = true;
   const overlay = document.createElement('div');
   overlay.style.position = 'fixed';
   overlay.style.top = '0';
@@ -755,6 +1227,7 @@ function startSelection(ratio) {
   const cancel = () => {
     finish();
     if (captureRectDiv && currentRect) captureRectDiv.style.display = 'block';
+    if (elementOutline) elementOutline.hidden = false;
     chrome.runtime.sendMessage({ command: 'areaSelectionCancelled' });
   };
 
@@ -791,6 +1264,7 @@ function startSelection(ratio) {
       return;
     }
     finish();
+    clearElementOutline(); // the area replaces a picked element
     rectRatio = ratio || null;
 
     const rect = { 

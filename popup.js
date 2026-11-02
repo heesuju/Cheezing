@@ -22,6 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const autoStopCheckbox     = document.getElementById('autoStopCheckbox');
   const maxCapturesInput     = document.getElementById('maxCapturesInput');
   const maxStripTilesInput   = document.getElementById('maxStripTilesInput');
+  const elementWaitInput     = document.getElementById('elementWaitInput');
   const captureModeGroup     = document.getElementById('captureModeGroup');
   const modeStatus           = document.getElementById('modeStatus');
   const zoomMultiplierGroup  = document.getElementById('zoomMultiplierGroup');
@@ -226,6 +227,9 @@ document.addEventListener('DOMContentLoaded', () => {
         chrome.runtime.sendMessage({ command: 'clearArea' }, (response) => {
           if (response) updateUI(response);
         });
+      } else if (val === 'element') {
+        // Pick right away; close the popup so the page can be pointed at
+        chrome.runtime.sendMessage({ command: 'startPickingElement' }, () => window.close());
       } else {
         // Start drawing right away; close the popup so the page can be dragged on
         const ratio = val === 'free' ? null : parseFloat(val);
@@ -296,6 +300,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.activeElement !== maxStripTilesInput) {
       maxStripTilesInput.value = state.maxStripTiles ?? 2000;
     }
+    if (document.activeElement !== elementWaitInput) {
+      elementWaitInput.value = state.elementWait ?? 1;
+    }
 
     // Capture mode, e.g. "Screen", "Long", "Hi-Res 4x", "Long + Hi-Res 4x"
     const zoomMultiplier = state.zoomMultiplier || 4;
@@ -342,7 +349,12 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshMacroPanelSections();
 
     // Capture area
-    if (state.captureRect) {
+    if (state.captureElement) {
+      setActiveAreaBtn('element');
+      const el = state.captureElement;
+      areaStatus.textContent = `${el.label} (${el.width}×${el.height})`;
+      areaStatus.title = el.frames && el.frames.length ? [...el.frames, el.selector].join(' ⟶ ') : el.selector;
+    } else if (state.captureRect) {
       const activeRatio = state.captureRatio ? String(state.captureRatio) : 'free';
       setActiveAreaBtn(activeRatio);
       areaStatus.textContent = `${Math.round(state.captureRect.width)}×${Math.round(state.captureRect.height)}`;
@@ -350,6 +362,7 @@ document.addEventListener('DOMContentLoaded', () => {
       setActiveAreaBtn('full');
       areaStatus.textContent = t('fullPage');
     }
+    if (!state.captureElement) areaStatus.removeAttribute('title');
 
     // Global state modes
     if (state.isSelectingArea) {
@@ -463,6 +476,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const value = Math.max(0, parseInt(maxStripTilesInput.value, 10) || 0);
     maxStripTilesInput.value = value;
     chrome.runtime.sendMessage({ command: 'updateOption', key: 'maxStripTiles', value });
+  });
+
+  elementWaitInput.addEventListener('change', () => {
+    const value = Math.min(60, Math.max(0, parseFloat(elementWaitInput.value) || 0));
+    elementWaitInput.value = value;
+    chrome.runtime.sendMessage({ command: 'updateOption', key: 'elementWait', value });
   });
 
   createPdfCheckbox.addEventListener('change', () => {

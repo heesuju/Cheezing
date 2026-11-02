@@ -6,6 +6,7 @@ let state = {
   isPaused: false, // a capture is waiting for its tab to be visible again
   isSelectingArea: false,
   captureRect: null,
+  captureElement: null,   // picked element { selector, frames, label, width, height }, instead of an area
   prefix: '',
   actions: [],
   captureFirst: true,
@@ -21,7 +22,8 @@ let state = {
   longCapture: false,     // Long: scroll and stitch the whole page into one strip
   hiRes: false,           // Hi-Res: render at zoomMultiplier× (also applies to Long)
   zoomMultiplier: 4,      // 2 | 3 | 4 -- Hi-Res resolution multiplier (Settings)
-  maxStripTiles: 2000     // Long: max scroll steps per capture, 0 = no limit (Settings)
+  maxStripTiles: 2000,    // Long: max scroll steps per capture, 0 = no limit (Settings)
+  elementWait: 1          // Element: seconds to wait for the element to finish loading (Settings)
 };
 
 const ZOOM_ATTACH_SETTLE_DELAY = 300; // ms for the page to repaint after the debugger bar appears
@@ -35,12 +37,16 @@ const MAX_STRIP_AREA = 64000000; // px per stitched strip file, keeps canvas mem
 const CAPTURE_MIN_INTERVAL = 550; // captureVisibleTab is capped at 2 calls/sec
 const PDF_MAX_PAGE_DIM = 14400; // PDF spec limit for a page side, in points
 const PDF_BAND_PIXELS = 4000000; // px converted at a time when writing a PDF page
+const ELEMENT_WAIT_TIMEOUT = 10000; // ms to wait for a picked element to show up and finish loading
+const ELEMENT_STABLE_MS = 500;      // ms its size must hold before it counts as loaded
+const ELEMENT_MISSING_STOP_COUNT = 3; // macro steps in a row without the element before the run stops
+const STEP_IMAGE_WAIT = 2000;       // max ms per Element capture step for images in view to load
 
 // Settings that must survive Chrome shutting the service worker down when
 // idle (which resets everything in memory). Messages wait for this to load.
 const PERSISTED_KEYS = [
   'longCapture', 'hiRes', 'zoomMultiplier', 'createPdf', 'captureFirst', 'skipDuplicates',
-  'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'macroEnabled', 'prefix', 'activeRecordingName'
+  'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'macroEnabled', 'prefix', 'activeRecordingName'
 ];
 
 const stateReady = chrome.storage.local.get(['savedRecordings', 'options']).then(({ savedRecordings, options }) => {
@@ -167,6 +173,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 function clearCaptureArea(tabId) {
   state.captureRect = null;
+  state.captureElement = null;
   const send = (id) => chrome.tabs.sendMessage(id, { command: 'clearArea' }).catch(() => {});
   if (tabId !== null) {
     send(tabId);
@@ -256,9 +263,35 @@ function handleMessage(message, sender, sendResponse) {
       }
     });
     sendResponse(state);
+  } else if (message.command === 'startPickingElement') {
+    state.isSelectingArea = true;
+    broadcastState();
+
+    chrome.tabs.query({active: true, lastFocusedWindow: true}, function(tabs) {
+      if (!tabs[0]) return;
+      // No debugger needed: the element is found again by selector at capture time
+      chrome.scripting.executeScript({
+        target: { tabId: tabs[0].id },
+        files: ['content.js']
+      }).then(() => {
+        chrome.tabs.sendMessage(tabs[0].id, { command: 'startPickingElement' }).catch(() => {});
+      }).catch(() => {
+        state.isSelectingArea = false;
+        broadcastState();
+      });
+    });
+    sendResponse(state);
+  } else if (message.command === 'elementSelected') {
+    state.isSelectingArea = false;
+    state.captureElement = message.element;
+    state.captureRect = null;
+    state.captureRatio = 'element';
+    broadcastState();
+    sendResponse(state);
   } else if (message.command === 'areaSelected') {
     state.isSelectingArea = false;
     state.captureRect = message.rect;
+    state.captureElement = null;
     state.captureRatio = pendingCaptureRatio;
     broadcastState();
     sendResponse(state);
@@ -324,7 +357,7 @@ function handleMessage(message, sender, sendResponse) {
     state.createPdf = message.createPdf;
     sendResponse(state);
   } else if (message.command === 'updateOption') {
-    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
+    if (['skipDuplicates', 'autoStopUnchanged', 'maxCaptures', 'maxStripTiles', 'elementWait', 'longCapture', 'hiRes', 'zoomMultiplier'].includes(message.key)) {
       state[message.key] = message.value;
     }
     sendResponse(state);
@@ -367,6 +400,16 @@ function handleMessage(message, sender, sendResponse) {
 }
 
 async function performCapture(tabs, tabId, prefix) {
+  if (state.captureElement) {
+    // Waits for it to load in (e.g. after a macro click); a capture without
+    // the element would be the wrong picture, so none is taken
+    if (!(await waitForElement(tabId, state.captureElement))) {
+      onElementMissing();
+      return;
+    }
+    elementMissingStreak = 0;
+  }
+
   // Ask before the tab is closed/reloaded/navigated mid-capture. Only during
   // the capture itself, so a macro that clicks a link still navigates freely.
   await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
@@ -374,11 +417,12 @@ async function performCapture(tabs, tabId, prefix) {
   let images;
   let streamed = null;
   try {
-    if (state.longCapture) {
+    if (state.longCapture || state.captureElement) {
       // A Long capture saves its parts as they're finished, unless it may
-      // still turn out to be a duplicate of the previous capture
+      // still turn out to be a duplicate of the previous capture. An Element
+      // capture is always a strip: the element can be taller than the screen.
       if (!(state.skipDuplicates && lastSignature !== null)) streamed = new StreamedCapture(prefix);
-      images = await captureScrollStrip(tabs, tabId, state.hiRes, streamed);
+      images = await captureScrollStrip(tabs, tabId, state.hiRes, streamed, state.captureElement, state.longCapture);
     } else if (state.hiRes) {
       images = await captureHiRes(tabs, tabId);
     } else {
@@ -410,6 +454,8 @@ const UNCHANGED_STOP_COUNT = 2;        // unchanged captures in a row before aut
 
 let lastSignature = null;
 let unchangedStreak = 0;
+let elementMissingStreak = 0;
+let runHasMacro = false;
 
 function resetRunCounters() {
   captureCount = 0;
@@ -417,6 +463,7 @@ function resetRunCounters() {
   state.runSkipped = 0;
   lastSignature = null;
   unchangedStreak = 0;
+  elementMissingStreak = 0;
 }
 
 async function recordCapture(images, prefix) {
@@ -529,6 +576,68 @@ function checkAutoStop() {
   return true;
 }
 
+// ── Picked element ─────────────────────────────────────────────────────
+// Waits until the picked element is on the page and has finished loading:
+// at least the Element wait (Settings) has passed -- content often arrives
+// after a pause no signal can see -- then its size has held, the page has
+// stopped changing, no requests are in flight (tracked during macro runs)
+// and the images showing in it have loaded. Returns false if it never
+// appeared. A still-changing element (e.g. an animation) is captured as it
+// is once the wait runs out.
+async function waitForElement(tabId, element) {
+  const minWait = Math.max(0, Number(state.elementWait) || 0) * 1000;
+  const start = Date.now();
+  const deadline = start + minWait + ELEMENT_WAIT_TIMEOUT;
+  let found = false;
+  let lastSize = null;
+  let sizeSince = 0;
+  while (state.isPlaying) {
+    // Re-injected in case a macro navigated to a new page
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
+    const info = await chrome.tabs.sendMessage(tabId, { command: 'findPickedElement', element }).catch(() => null);
+    const now = Date.now();
+    if (info && info.found && info.width >= 1 && info.height >= 1) {
+      found = true;
+      const size = `${Math.round(info.width)}x${Math.round(info.height)}`;
+      if (size !== lastSize) {
+        lastSize = size;
+        sizeSince = now;
+      }
+      if (now - start >= minWait &&
+          now - sizeSince >= ELEMENT_STABLE_MS &&
+          info.pendingImages === 0 &&
+          info.msSinceMutation >= SETTLE_QUIET &&
+          msSinceNetworkActivity() >= SETTLE_QUIET) {
+        return true;
+      }
+    } else {
+      lastSize = null;
+    }
+    if (now >= deadline) return found;
+    await sleep(SETTLE_POLL_INTERVAL);
+  }
+  return found;
+}
+
+// A single capture stops right away; a macro run keeps going for a few
+// steps (the element may come back, e.g. after a page turn) before stopping
+function onElementMissing() {
+  elementMissingStreak++;
+  if (!state.isPlaying) return;
+  if (runHasMacro && elementMissingStreak < ELEMENT_MISSING_STOP_COUNT) return;
+  state.isPlaying = false;
+  showFinishedNotification('elementMissing');
+}
+
+async function waitForImagesInView(tabId) {
+  const start = Date.now();
+  while (Date.now() - start < STEP_IMAGE_WAIT) {
+    const activity = await chrome.tabs.sendMessage(tabId, { command: 'getPageActivity' }).catch(() => null);
+    if (!activity || activity.pendingImages === 0) return;
+    await sleep(SETTLE_POLL_INTERVAL);
+  }
+}
+
 async function getStrings() {
   const { settings } = await chrome.storage.local.get('settings');
   return I18N[(settings && settings.language) || 'en'] || I18N.en;
@@ -536,12 +645,12 @@ async function getStrings() {
 
 async function showFinishedNotification(reason) {
   const strings = await getStrings();
-  const message = (reason === 'max' ? strings.finishedMax : strings.finishedUnchanged)
-    .replace('{n}', state.runSaved);
+  const messages = { max: strings.finishedMax, unchanged: strings.finishedUnchanged, elementMissing: strings.elementMissingMessage };
+  const message = messages[reason].replace('{n}', state.runSaved);
   chrome.notifications.create('capture-finished', {
     type: 'basic',
     iconUrl: DEFAULT_ICON[128],
-    title: strings.finishedNotifyTitle,
+    title: reason === 'elementMissing' ? strings.elementMissingTitle : strings.finishedNotifyTitle,
     message
   }).catch(() => {});
 }
@@ -731,8 +840,11 @@ async function captureTab(windowId) {
 // Each step crops from the position the scroller actually reached, so the
 // last step (which can't scroll a full height) contributes only new rows.
 // With `streamed`, each finished part is handed to it as soon as it's done
-// and the returned list is empty.
-async function captureScrollStrip(tabs, tabId, hiRes, streamed) {
+// and the returned list is empty. With `element` (a picked element), the
+// strip is that element from its top to its bottom, scrolled through
+// whatever scrolls it; with `long` too and a scrollable element, the
+// element's own contents are scrolled through instead.
+async function captureScrollStrip(tabs, tabId, hiRes, streamed, element = null, long = false) {
   const windowId = tabs[0].windowId;
 
   await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
@@ -743,8 +855,20 @@ async function captureScrollStrip(tabs, tabId, hiRes, streamed) {
   const hiResSession = hiRes ? await beginHiRes(tabId) : null;
   const multiplier = state.zoomMultiplier || DEFAULT_ZOOM_MULTIPLIER;
 
-  const plan = await chrome.tabs.sendMessage(tabId, { command: 'beginScrollStrip', rect: state.captureRect });
+  const plan = await chrome.tabs.sendMessage(tabId, {
+    command: 'beginScrollStrip',
+    rect: state.captureRect,
+    element,
+    long
+  }).catch(() => null);
+  if (!plan || plan.notFound) {
+    if (hiResSession) await endHiRes(hiResSession);
+    throw new Error('Scroll capture aborted: the selected element is no longer on the page.');
+  }
   const region = plan.region;
+  // Element mode: strip rows are the element's rows, which may start below
+  // the region's top and end before its bottom
+  const elementMode = !!plan.element;
   // Steps overlap by 1 CSS px: at fractional zoom/DPR the scroll position
   // snaps to device pixels and can land slightly short of the target, and the
   // overlap guarantees no gap. Duplicate rows are cropped below.
@@ -762,15 +886,22 @@ async function captureScrollStrip(tabs, tabId, hiRes, streamed) {
     // Step limit per capture: a safety stop for infinite feeds that keep growing
     const maxSteps = state.maxStripTiles > 0 ? state.maxStripTiles : Infinity;
     for (let i = 0; i < maxSteps && state.isPlaying; i++) {
-      let actual, maxScroll;
+      let pos;
       do {
         // Redone after a pause, in case the page was scrolled meanwhile
-        ({ actual, maxScroll } = await chrome.tabs.sendMessage(tabId, { command: 'scrollStripTo', y: target }));
-        if (i > 0) {
-          // Fixed headers/footers/floating buttons would otherwise repeat on every step
+        pos = await chrome.tabs.sendMessage(tabId, { command: 'scrollStripTo', y: target });
+        if (i > 0 || elementMode) {
+          // Fixed headers/footers/floating buttons would otherwise repeat on
+          // every step (or, over an element, cover its top)
           await chrome.tabs.sendMessage(tabId, { command: 'suppressStickyElements', enable: true }).catch(() => {});
         }
         await sleep(SCROLL_SETTLE_DELAY);
+        if (elementMode) {
+          // Lazy images scrolled into view; content loading in above the
+          // element can move it, so its position is measured again after
+          await waitForImagesInView(tabId);
+          pos = await chrome.tabs.sendMessage(tabId, { command: 'stripPosition' });
+        }
       } while (await waitUntilCapturable(tabId));
 
       // `source` holds the step's pixels; `origin*` is where the region starts
@@ -800,22 +931,23 @@ async function captureScrollStrip(tabs, tabId, hiRes, streamed) {
       }
 
       // Work in absolute pixel rows: this step shows strip rows
-      // [tileTop, tileTop + regionH). Keep only rows not yet written.
-      const tileTop = Math.round(actual * scale);
-      const from = Math.max(writtenPx, tileTop);
+      // [tileTop, tileTop + regionH). Keep only rows not yet written (and,
+      // for an element, only its own rows).
+      const tileTop = Math.round(pos.top * scale);
+      const from = Math.max(writtenPx, tileTop, 0);
+      const endPx = elementMode ? Math.round(pos.end * scale) : Infinity;
       const sx = originX;
       const sy = originY + (from - tileTop);
       const sw = regionW;
-      const sh = Math.min(tileTop + regionH - from, source.height - sy);
-      const isLast = actual >= maxScroll - 0.5;
+      const sh = Math.min(tileTop + regionH - from, source.height - sy, endPx - from);
       if (sh > 0) {
         if (!writer) writer = new StripWriter(sw, streamed ? (image) => streamed.add(image) : null);
-        const remaining = Math.round(maxScroll * scale) + regionH - from;
+        const remaining = (elementMode ? endPx : Math.round(pos.maxScroll * scale) + regionH) - from;
         await writer.add(source, sx, sy, sh, remaining);
         writtenPx = from + sh;
       }
 
-      if (isLast || actual + 0.5 < target - step) break; // reached the end / scroller stuck
+      if (pos.atEnd || pos.top + 0.5 < target - step) break; // reached the end / scroller stuck
       target += step;
     }
 
@@ -827,7 +959,7 @@ async function captureScrollStrip(tabs, tabId, hiRes, streamed) {
   } finally {
     await chrome.tabs.sendMessage(tabId, { command: 'endScrollStrip' }).catch(() => {});
     if (hiResSession) await endHiRes(hiResSession);
-    if (state.captureRect) {
+    if (state.captureRect || state.captureElement) {
       await chrome.tabs.sendMessage(tabId, { command: 'showRect' }).catch(() => {});
     }
   }
@@ -1092,6 +1224,7 @@ async function takeSingleCapture(prefix) {
   const tabs = await chrome.tabs.query({active: true, lastFocusedWindow: true});
   if (tabs.length > 0) {
     resetRunCounters();
+    runHasMacro = false;
     try {
       await performCapture(tabs, tabs[0].id, sessionPrefix);
     } catch (err) {
@@ -1137,6 +1270,7 @@ async function startPlayback(prefix) {
   await chrome.tabs.sendMessage(tabId, { command: 'setRectLocked', locked: true }).catch(() => {});
 
   resetRunCounters();
+  runHasMacro = true;
   broadcastState();
 
   let actionsRan = false;
